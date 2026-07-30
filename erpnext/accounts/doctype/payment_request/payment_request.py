@@ -459,6 +459,11 @@ class PaymentRequest(Document):
 			else:
 				return True
 		except Exception:
+			frappe.log_error(
+				title=f"Payment Gateway validation failed: {self.payment_gateway}",
+				reference_doctype=self.doctype,
+				reference_name=self.name,
+			)
 			return False
 
 	def set_payment_request_url(self):
@@ -943,6 +948,7 @@ def set_payment_references(payment_schedules):
 				"description": row.get("description"),
 				"due_date": row.get("due_date"),
 				"amount": row.get("payment_amount"),
+				"currency": row.get("currency"),
 			}
 		)
 
@@ -1226,7 +1232,7 @@ def get_subscription_details(reference_doctype: str, reference_name: str):
 
 
 @frappe.whitelist()
-def make_payment_order(source_name: str, target_doc: str | Document | None = None):
+def make_payment_order(source_name: str, target_doc: str | dict | Document | None = None):
 	from frappe.model.mapper import get_mapped_doc
 
 	def set_missing_values(source, target):
