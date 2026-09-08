@@ -110,6 +110,23 @@ class TestProductionPlan(ERPNextTestSuite):
 		pln = frappe.get_doc("Production Plan", pln.name)
 		pln.cancel()
 
+	def test_production_plan_material_request_skips_zero_qty_items(self):
+		pln = create_production_plan(item_code="Test Production Item 1")
+		zero_qty_item, requested_item = pln.mr_items
+		zero_qty_item.quantity = "0"
+
+		pln.make_material_request()
+
+		material_request_items = frappe.get_all(
+			"Material Request Item",
+			filters={"production_plan": pln.name},
+			fields=["item_code", "qty"],
+		)
+		self.assertEqual(
+			material_request_items,
+			[{"item_code": requested_item.item_code, "qty": requested_item.quantity}],
+		)
+
 	def test_production_plan_start_date(self):
 		"Test if Work Order has same Planned Start Date as Prod Plan."
 		planned_date = add_to_date(date=None, days=3)
@@ -1160,12 +1177,12 @@ class TestProductionPlan(ERPNextTestSuite):
 	def test_multiple_work_order_for_production_plan_item(self):
 		"Test producing Prod Plan (making WO) in parts."
 
-		def create_work_order(item, pln, qty):
+		def create_work_order(pln, qty):
 			# Get Production Items
 			items_data = pln.get_production_items()
 
 			# Update qty
-			items_data[(pln.po_items[0].name, item, None, pln.po_items[0].planned_start_date)]["qty"] = qty
+			items_data[pln.po_items[0].name]["qty"] = qty
 
 			# Create and Submit Work Order for each item in items_data
 			for _key, item in items_data.items():
@@ -1193,17 +1210,17 @@ class TestProductionPlan(ERPNextTestSuite):
 		wo_list = []
 
 		# Create and Submit 1st Work Order for 3 qty
-		create_work_order(item, pln, 3)
+		create_work_order(pln, 3)
 		pln.reload()
 		self.assertEqual(pln.po_items[0].ordered_qty, 3)
 
 		# Create and Submit 2nd Work Order for 2 qty
-		create_work_order(item, pln, 2)
+		create_work_order(pln, 2)
 		pln.reload()
 		self.assertEqual(pln.po_items[0].ordered_qty, 5)
 
 		# Overproduction
-		self.assertRaises(OverProductionError, create_work_order, item=item, pln=pln, qty=2)
+		self.assertRaises(OverProductionError, create_work_order, pln=pln, qty=2)
 
 		# Cancel 1st Work Order
 		wo1 = frappe.get_doc("Work Order", wo_list[0])
@@ -1384,8 +1401,11 @@ class TestProductionPlan(ERPNextTestSuite):
 		make_bom(item=fg_item, raw_materials=[sub_assembly_item], rm_qty=4)
 
 		# Step - 1: Create Production Plan
-		pln = create_production_plan(item_code=fg_item, planned_qty=5, skip_getting_mr_items=1)
+		pln = create_production_plan(
+			item_code=fg_item, planned_qty=5, skip_getting_mr_items=1, do_not_submit=1
+		)
 		pln.get_sub_assembly_items()
+		pln.submit()
 
 		# Step - 2: Create Work Orders
 		pln.make_work_order()
