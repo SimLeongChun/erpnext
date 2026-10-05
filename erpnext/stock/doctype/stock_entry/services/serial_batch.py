@@ -88,7 +88,7 @@ class StockEntrySABB(BaseStockEntry):
 			frappe.qb.from_(table)
 			.join(child_table)
 			.on(table.name == child_table.parent)
-			.select(child_table.serial_no, child_table.batch_no, child_table.qty)
+			.select(child_table.serial_no, child_table.batch_no, child_table.qty, child_table.delivered_qty)
 			.where((table.docstatus == 1) & (table.voucher_detail_no == scio_detail))
 		)
 
@@ -100,8 +100,9 @@ class StockEntrySABB(BaseStockEntry):
 		for d in query.run(as_dict=True):
 			if d.serial_no and d.serial_no not in serial_nos:
 				serial_nos.append(d.serial_no)
-			if d.batch_no and d.batch_no not in batch_nos:
-				batch_nos[d.batch_no] = d.qty
+			if d.batch_no:
+				qty = d.qty - d.delivered_qty if only_pending else d.qty
+				batch_nos[d.batch_no] = batch_nos.get(d.batch_no, 0) + qty
 
 		return serial_nos, batch_nos
 
@@ -205,6 +206,8 @@ class StockEntrySABB(BaseStockEntry):
 			original_qty = self._distribute_batches_to_item(
 				d, batches, details, new_items_to_add, original_qty
 			)
+			if original_qty > 0 and d.batch_no:
+				self._make_unreserved_row(d, new_items_to_add, original_qty)
 		if details.get("serial_no"):
 			d.serial_no = "\n".join(details.get("serial_no")[: cint(d.qty)])
 
@@ -214,36 +217,31 @@ class StockEntrySABB(BaseStockEntry):
 				break
 			if qty <= 0:
 				continue
+			qty = min(qty, original_qty)
 			if d.batch_no:
-				original_qty, _ = self._make_overflow_batch_row(
-					d, batches, details, new_items_to_add, batch_no, qty, original_qty
-				)
+				self._make_overflow_batch_row(d, batches, details, new_items_to_add, batch_no, qty)
 			else:
 				self._assign_batch_to_item(d, batches, details, batch_no, qty)
+			original_qty -= qty
 		return original_qty
 
-	def _make_overflow_batch_row(self, d, batches, details, new_items_to_add, batch_no, qty, original_qty):
+	def _make_overflow_batch_row(self, d, batches, details, new_items_to_add, batch_no, qty):
 		new_row = frappe.copy_doc(d)
 		new_row.name = None
-		new_row.batch_no = batch_no
-		new_row.qty = qty
-		new_row.idx = d.idx + 1
-		if new_row.batch_no and details.get("batchwise_sn"):
-			new_row.serial_no = "\n".join(details.get("batchwise_sn")[new_row.batch_no][: cint(new_row.qty)])
+		self._assign_batch_to_item(new_row, batches, details, batch_no, qty)
 		new_items_to_add.append(new_row)
-		batches[batch_no] -= qty
-		return original_qty - qty, new_row
+
+	def _make_unreserved_row(self, d, new_items_to_add, qty):
+		new_row = frappe.copy_doc(d)
+		new_row.update({"name": None, "batch_no": None, "serial_no": None, "qty": qty})
+		new_items_to_add.append(new_row)
 
 	def _assign_batch_to_item(self, d, batches, details, batch_no, qty):
-		if qty >= d.qty:
-			d.batch_no = batch_no
-			batches[batch_no] -= d.qty
-		else:
-			d.batch_no = batch_no
-			d.qty = qty
-			batches[batch_no] = 0
-		if d.batch_no and details.get("batchwise_sn"):
-			d.serial_no = "\n".join(details.get("batchwise_sn")[d.batch_no][: cint(d.qty)])
+		d.batch_no = batch_no
+		d.qty = qty
+		batches[batch_no] -= qty
+		if details.get("batchwise_sn"):
+			d.serial_no = "\n".join(details.get("batchwise_sn")[batch_no][: cint(qty)])
 
 	def _sort_and_reindex_items(self):
 		sorted_items = sorted(self.doc.items, key=lambda x: x.item_code)
