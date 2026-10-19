@@ -10,6 +10,7 @@ callers and the whitelisted entry point keep working unchanged.
 
 import frappe
 from frappe import _
+from frappe.query_builder.functions import IfNull
 from frappe.utils import flt
 from pypika import functions as fn
 
@@ -432,19 +433,23 @@ class RequiredItemsService:
 			)
 
 	def _split_consumption_over_reservations(self, consumed_by_item, wip_warehouse):
-		sre = frappe.qb.DocType("Stock Reservation Entry")
-		query = (
-			frappe.qb.from_(sre)
-			.select(sre.voucher_detail_no, sre.warehouse, fn.Sum(sre.reserved_qty).as_("qty"))
-			.where(
-				(sre.voucher_type == "Work Order") & (sre.voucher_no == self.doc.name) & (sre.docstatus == 1)
-			)
-			.groupby(sre.voucher_detail_no, sre.warehouse)
-		)
+		"""Cap each row's consumption by the reservations that hold it, including those a closed Work Order keeps."""
+		filters = {"voucher_type": "Work Order", "voucher_no": self.doc.name}
 		if not self.doc.skip_transfer:
-			query = query.where(fn.Coalesce(sre.from_voucher_no, "") != "")
+			filters["from_voucher_no"] = ("is", "set")
+		filters, or_filters = WorkOrderStockReservation(self.doc).get_holding_filters(filters, "consumed_qty")
 
-		reserved = {(row.voucher_detail_no, row.warehouse): flt(row.qty) for row in query.run(as_dict=True)}
+		sre = frappe.qb.DocType("Stock Reservation Entry")
+		reserved = {
+			(row.voucher_detail_no, row.warehouse): flt(row.qty)
+			for row in frappe.qb.get_query(
+				"Stock Reservation Entry",
+				fields=[sre.voucher_detail_no, sre.warehouse, fn.Sum(sre.reserved_qty).as_("qty")],
+				filters=filters,
+				or_filters=or_filters,
+				group_by="voucher_detail_no, warehouse",
+			).run(as_dict=True)
+		}
 		reserved_by_row = {
 			row.name: reserved.get((row.name, wip_warehouse or row.source_warehouse), 0.0)
 			for row in self.doc.required_items
@@ -472,7 +477,7 @@ class RequiredItemsService:
 				(ste.work_order == self.doc.name)
 				& (ste.purpose.isin(CONSUMPTION_PURPOSES))
 				& (ste.docstatus == 1)
-				& (ste_child.s_warehouse.isnotnull())
+				& (IfNull(ste_child.s_warehouse, "") != "")
 			)
 			.groupby(item_code)
 		)
