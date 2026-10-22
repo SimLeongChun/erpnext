@@ -16,7 +16,7 @@ from erpnext.buying.utils import update_last_purchase_rate
 from erpnext.stock.doctype.item.item import validate_item_uoms
 from erpnext.stock.doctype.packed_item.packed_item import make_packing_list
 from erpnext.stock.get_item_details import (
-	get_bin_details,
+	_get_bin_details,
 	get_conversion_factor,
 	get_item_warehouse_,
 )
@@ -178,7 +178,7 @@ class ChildItemUpdater:
 			parent.set_gross_profit()
 
 		frappe.get_cached_doc("Authorization Control").validate_approving_authority(
-			parent.doctype, parent.company, parent.base_grand_total
+			parent.doctype, parent.company, parent.base_grand_total, parent
 		)
 
 		if self.parent_doctype != "Supplier Quotation":
@@ -197,6 +197,10 @@ class ChildItemUpdater:
 
 		for idx, row in enumerate(parent.get(self.child_docname), start=1):
 			row.idx = idx
+
+		from erpnext.accounts.services.party_validation import PartyValidator
+
+		PartyValidator(parent).validate_party_specific_items()
 
 		parent.save()
 
@@ -504,7 +508,7 @@ def set_order_defaults(
 	child_item.warehouse = get_new_child_item_warehouse(p_doc, item, trans_item, child_doctype)
 	conversion_factor = flt(get_conversion_factor(item.item_code, child_item.uom).get("conversion_factor"))
 	child_item.conversion_factor = flt(trans_item.get("conversion_factor")) or conversion_factor
-	child_item.update(get_bin_details(child_item.item_code, child_item.warehouse, p_doc.get("company")))
+	child_item.update(_get_bin_details(child_item.item_code, child_item.warehouse, p_doc.get("company")))
 
 	if child_doctype in ("Purchase Order Item", "Supplier Quotation Item"):
 		child_item.base_rate = 1
