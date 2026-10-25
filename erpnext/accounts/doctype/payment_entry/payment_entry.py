@@ -116,9 +116,11 @@ class PaymentEntry(AccountsController):
 		paid_from: DF.Link
 		paid_from_account_currency: DF.Link
 		paid_from_account_type: DF.Data | None
+		paid_from_bank_account: DF.Link | None
 		paid_to: DF.Link
 		paid_to_account_currency: DF.Link
 		paid_to_account_type: DF.Data | None
+		paid_to_bank_account: DF.Link | None
 		party: DF.DynamicLink | None
 		party_bank_account: DF.Link | None
 		party_name: DF.Data | None
@@ -179,6 +181,7 @@ class PaymentEntry(AccountsController):
 		self.set_missing_ref_details(force=True)
 		self.validate_payment_type()
 		self.validate_internal_transfer_accounts()
+		self.set_internal_transfer_bank_accounts()
 		self.validate_party_details()
 		self.set_exchange_rate()
 		self.validate_mandatory()
@@ -351,6 +354,13 @@ class PaymentEntry(AccountsController):
 				)
 
 			reference_names.add(key)
+
+	def set_internal_transfer_bank_accounts(self):
+		for side in ("paid_from", "paid_to"):
+			bank_account = None
+			if self.payment_type == "Internal Transfer" and self.get(side):
+				bank_account = frappe.db.get_value("Bank Account", {"account": self.get(side), "disabled": 0})
+			self.set(f"{side}_bank_account", bank_account)
 
 	def set_bank_account_data(self):
 		if not self.bank_account:
@@ -650,6 +660,24 @@ class PaymentEntry(AccountsController):
 			frappe.throw(_("Paid From and Paid To accounts must be different for an Internal Transfer."))
 
 	def validate_party_details(self):
+		if self.party_type:
+			if not frappe.db.exists("Party Type", self.party_type):
+				frappe.throw(_("{0} is not a valid Party Type").format(self.party_type))
+
+			if self.get("party_account") and self.party_type != "Employee":
+				account_type = frappe.get_cached_value("Account", self.party_account, "account_type")
+				party_account_type = frappe.get_cached_value("Party Type", self.party_type, "account_type")
+				if (
+					account_type != party_account_type
+					and not (self.party_type == "Shareholder" and account_type == "Equity")
+					and not self.book_advance_payments_in_separate_party_account
+				):
+					frappe.throw(
+						_("Account {0} and Party Type {1} have different account types").format(
+							self.party_account, self.party_type
+						)
+					)
+
 		if self.party and not frappe.db.exists(self.party_type, self.party):
 			frappe.throw(_("{0} {1} does not exist").format(_(self.party_type), self.party))
 
@@ -2465,7 +2493,7 @@ def get_party_details(company: str, party_type: str, party: str, date: str, cost
 
 	party_account = get_party_account(party_type, party, company)
 	account_currency = get_account_currency(party_account)
-	_party_name = "title" if party_type == "Shareholder" else party_type.lower() + "_name"
+	_party_name = frappe.get_meta(party_type).get_title_field()
 	party_name = frappe.db.get_value(party_type, party, _party_name)
 
 	if party_type in ["Customer", "Supplier"]:
