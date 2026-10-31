@@ -18,6 +18,7 @@ from erpnext.stock.doctype.packed_item.packed_item import make_packing_list
 from erpnext.stock.get_item_details import (
 	_get_bin_details,
 	get_conversion_factor,
+	get_default_bom,
 	get_item_warehouse_,
 )
 from erpnext.stock.utils import (
@@ -266,7 +267,8 @@ class ChildItemUpdater:
 		self._validate_workflow()
 
 		if self.parent_doctype in ("Purchase Order", "Sales Order"):
-			parent.update_blanket_order()
+			# Covers blanket orders of removed rows, which are no longer on the items
+			parent.update_blanket_order({blanket_order for blanket_order, _ in self._blanket_order_change})
 			parent.update_billing_percentage()
 			parent.set_status()
 
@@ -508,15 +510,11 @@ class ChildItemUpdater:
 					)
 				)
 
-			is_sub_contracted_item, default_bom = frappe.db.get_value(
-				"Item", new_data["fg_item"], ["is_sub_contracted_item", "default_bom"]
-			)
-
-			if not is_sub_contracted_item:
+			if not frappe.db.get_value("Item", new_data["fg_item"], "is_sub_contracted_item"):
 				frappe.throw(
 					_("Finished Good Item {0} must be a sub-contracted item").format(new_data["fg_item"])
 				)
-			elif not default_bom:
+			elif not get_default_bom(new_data["fg_item"]):
 				frappe.throw(_("Default BOM not found for FG Item {0}").format(new_data["fg_item"]))
 
 		if not new_data.get("fg_item_qty"):
