@@ -1011,8 +1011,6 @@ class JobCard(Document):
 				"item_name": d.item_name,
 				"description": d.description,
 				"required_qty": (d.required_qty * flt(self.for_quantity)) / flt(operation_qty or doc.qty),
-				"rate": d.rate,
-				"amount": d.amount,
 			},
 		)
 
@@ -1305,9 +1303,7 @@ class JobCard(Document):
 				"Kindly cancel the Manufacturing Entries first against the work order {0}."
 			).format(frappe.bold(get_link_to_form("Work Order", self.work_order)))
 
-			frappe.throw(
-				_("{0} {1}").format(first_part_msg, second_part_msg), JobCardCancelError, title=_("Error")
-			)
+			frappe.throw(first_part_msg + " " + second_part_msg, JobCardCancelError, title=_("Error"))
 
 	def update_work_order_data(self, for_quantity, process_loss_qty, pending_qty, time_in_mins, wo):
 		time_data = self.get_operation_time_data()
@@ -1980,6 +1976,7 @@ class JobCard(Document):
 
 	def set_employees(self):
 		self.employee = []
+		# nosemgrep: frappe-semgrep-rules.rules.frappe-modifying-child-tables-while-iterating -- appends to employee, not time_logs
 		for item in self.time_logs:
 			if not any(d.employee == item.employee for d in self.employee):
 				self.append("employee", {"employee": item.employee, "completed_qty": 0.0})
@@ -2134,7 +2131,7 @@ class JobCard(Document):
 		self.set_for_quantity(kwargs)
 
 		self.pending_qty = flt(kwargs.pending_qty)
-		self.process_loss_qty = flt(kwargs.process_loss_qty)
+		self.process_loss_qty = flt(self.process_loss_qty) + flt(kwargs.process_loss_qty)
 
 		self.add_completion_time_logs(kwargs)
 
@@ -2143,11 +2140,14 @@ class JobCard(Document):
 
 	def set_for_quantity(self, kwargs):
 		"""Qty to Manufacture of the completion dialog covers the current cycle only,
-		so the qty completed by the earlier cycles of this job card is kept."""
+		so the qty completed and lost by the earlier cycles of this job card is kept."""
 		if not flt(kwargs.for_quantity):
 			return
 
-		self.for_quantity = flt(self.total_completed_qty) + flt(kwargs.for_quantity)
+		self.for_quantity = flt(
+			flt(self.total_completed_qty) + flt(self.process_loss_qty) + flt(kwargs.for_quantity),
+			self.precision("for_quantity"),
+		)
 
 	def validate_docstatus(self):
 		if self.docstatus == 2:
