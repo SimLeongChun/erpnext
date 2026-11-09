@@ -19,10 +19,11 @@ from erpnext.controllers.sales_and_purchase_return import (
 	available_serial_batch_for_return,
 	filter_serial_batches,
 	make_serial_batch_bundle_for_return,
+	remove_picked_serial_batches,
 )
-from erpnext.stock.doctype.batch.batch import get_batch_qty
 from erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle import (
 	combine_datetime,
+	get_batch_qty_for_stock,
 	get_type_of_transaction,
 )
 from erpnext.stock.serial_batch_identity import SerialBatchIdentity
@@ -123,6 +124,7 @@ class SerialBatchBundleService:
 		if self.doc.doctype == "Stock Entry" and self.doc.purpose in ["Material Issue", "Material Transfer"]:
 			is_material_issue = True
 
+		check_batches = self.is_batch_check_needed()
 		for d in self.doc.get("items"):
 			if hasattr(d, "serial_no") and hasattr(d, "batch_no") and d.serial_no and d.batch_no:
 				serial_nos = SerialBatchIdentity("Serial No").get_records(
@@ -140,7 +142,8 @@ class SerialBatchBundleService:
 						)
 
 			if (
-				flt(d.qty) > 0.0
+				check_batches
+				and flt(d.qty) > 0.0
 				and d.get("batch_no")
 				and self.doc.get("posting_date")
 				and self.doc.docstatus < 2
@@ -152,7 +155,17 @@ class SerialBatchBundleService:
 					d.idx, d.batch_no, None if is_material_issue else expiry_date, disabled
 				)
 
-		self.validate_outward_bundle_batches(check_expiry=not is_material_issue)
+		if check_batches:
+			self.validate_outward_bundle_batches(check_expiry=not is_material_issue)
+
+	def is_batch_check_needed(self) -> bool:
+		"""An invoice without Update Stock moves no stock, so its batches were checked when they moved.
+		A consolidated invoice repeats POS Invoices whose batches were checked when sold."""
+		if self.doc.flags.is_consolidated:
+			return False
+
+		is_invoice = self.doc.doctype in ("Sales Invoice", "Purchase Invoice")
+		return not is_invoice or bool(self.doc.get("update_stock"))
 
 	def validate_batch_is_usable(self, idx, batch_no, expiry_date, disabled):
 		from erpnext.exceptions import BatchExpiredError
@@ -387,10 +400,13 @@ class SerialBatchBundleService:
 						)
 					)
 
-				data = filter_serial_batches(
+				picked = filter_serial_batches(
 					self.doc, data, row, warehouse_field=warehouse_field, qty_field=qty_field
 				)
-				bundle = make_serial_batch_bundle_for_return(data, row, self.doc, warehouse_field, qty_field)
+				bundle = make_serial_batch_bundle_for_return(
+					picked, row, self.doc, warehouse_field, qty_field
+				)
+				remove_picked_serial_batches(data, picked, self.doc)
 				if row.get("return_qty_from_rejected_warehouse"):
 					row.db_set(
 						{
@@ -432,8 +448,9 @@ class SerialBatchBundleService:
 					continue
 
 			if data := available_dict.get(value):
-				data = filter_serial_batches(self.doc, data, row)
-				bundle = make_serial_batch_bundle_for_return(data, row, self.doc)
+				picked = filter_serial_batches(self.doc, data, row)
+				bundle = make_serial_batch_bundle_for_return(picked, row, self.doc)
+				remove_picked_serial_batches(data, picked, self.doc)
 				row.db_set(
 					{
 						"serial_and_batch_bundle": bundle,
@@ -774,7 +791,7 @@ class SerialBatchBundleService:
 			if flt(reserved_qty, precision) <= 0:
 				continue
 
-			batch_qty = get_batch_qty(
+			batch_qty = get_batch_qty_for_stock(
 				batch_no,
 				warehouse,
 				posting_date=self.doc.posting_date,

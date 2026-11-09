@@ -938,12 +938,12 @@ class SerialandBatchBundle(Document):
 			# over the accepted quantity does not belong to it.
 			rate = flt(self.get_transit_rate(row)) or rate
 
-		transfer_rates = self.get_transfer_rates()
+		entry_rates = self.get_transfer_rates() or self.get_subcontracting_return_rates()
 		precision = frappe.get_precision("Serial and Batch Entry", "incoming_rate")
 		for d in self.entries:
 			is_queue_valued = valuation_method in ("FIFO", "LIFO") and d.batch_no in batches
 
-			entry_rate = transfer_rates.get((d.serial_no, d.batch_no), rate)
+			entry_rate = entry_rates.get((d.serial_no, d.batch_no), rate)
 
 			if self.is_rejected and not values_rejected_material:
 				entry_rate = 0.0
@@ -1293,6 +1293,35 @@ class SerialandBatchBundle(Document):
 				fields=["serial_no", "batch_no", "incoming_rate"],
 			)
 		}
+
+	def get_subcontracting_return_rates(self) -> dict:
+		"""Rate the returned Subcontracting Receipt consumed each serial/batch of a supplied item at."""
+		from erpnext.stock.utils import get_valuation_method
+
+		if self.voucher_type != "Subcontracting Receipt" or not self.voucher_detail_no:
+			return {}
+
+		row = frappe.db.get_value(
+			"Subcontracting Receipt Supplied Item",
+			self.voucher_detail_no,
+			["parent", "reference_name", "rm_item_code"],
+			as_dict=True,
+		)
+		if not row:
+			return {}
+
+		receipt = frappe.get_doc("Subcontracting Receipt", row.parent)
+		# rejected returns and Standard Cost items keep the row rate
+		if (
+			not receipt.is_return
+			or row.reference_name in receipt.get_rejected_return_rows()
+			or get_valuation_method(self.item_code, self.company) == "Standard Cost"
+		):
+			return {}
+
+		receipt_item = receipt.get("items", {"name": row.reference_name})[0].subcontracting_receipt_item
+		consumed = receipt.get_consumed_serial_batches().get((receipt_item, row.rm_item_code), {})
+		return {key: identity.rate for key, identity in consumed.items()}
 
 	def get_transit_rate(self, row) -> float:
 		"""What the material was worth on its way into the in-transit warehouse."""
@@ -1979,15 +2008,16 @@ class SerialandBatchBundle(Document):
 		sle_query, sle = self.get_batch_query_from_stock_ledger()
 		sabb_query, child = self.get_batch_query_from_sabb()
 		queries = [
-			sle_query.select(Sum(sle.actual_qty).as_("qty"))
-			.where(sle.posting_datetime < posting_datetime)
-			.groupby(sle.batch_no),
-			sabb_query.select(Sum(child.qty).as_("qty"))
-			.where(child.posting_datetime < posting_datetime)
-			.groupby(child.batch_no),
+			sle_query.select(sle.actual_qty.as_("qty")).where(sle.posting_datetime < posting_datetime),
+			sabb_query.select(child.qty).where(child.posting_datetime < posting_datetime),
 		]
 		for query in queries:
-			for row in query.run(as_dict=True):
+			batch_qty = (
+				frappe.qb.from_(query)
+				.select(query.batch_no, Sum(query.qty).as_("qty"))
+				.groupby(query.batch_no)
+			)
+			for row in batch_qty.run(as_dict=True):
 				available_qty[row.batch_no] = flt(available_qty.get(row.batch_no)) + flt(row.qty)
 
 		return available_qty
@@ -3289,6 +3319,24 @@ def get_reserved_batches_for_sre(kwargs) -> dict:
 	return reserved_batches_details
 
 
+def get_batch_qty_for_stock(batch_no=None, warehouse=None, posting_date=None, posting_time=None, **kwargs):
+	"""Internal stock calculations must include quantities in all relevant warehouses."""
+	kwargs = frappe._dict(kwargs)
+	kwargs.update(
+		batch_no=batch_no,
+		warehouse=warehouse,
+		based_on=frappe.get_single_value("Stock Settings", "pick_serial_and_batch_based_on"),
+	)
+	if not kwargs.posting_datetime and posting_date:
+		kwargs.posting_datetime = combine_datetime(posting_date, posting_time)
+
+	batches = get_auto_batch_nos(kwargs)
+	if batch_no and warehouse:
+		return sum(row.qty for row in batches if row.batch_no == batch_no)
+
+	return batches
+
+
 def get_auto_batch_nos(kwargs):
 	if kwargs.against_sales_order and (
 		only_consider_batches := get_batches_to_be_considered(kwargs.against_sales_order)
@@ -3367,14 +3415,12 @@ def remove_reservation_conflict_batches(available_batches, kwargs):
 
 
 def get_cross_warehouse_reserved_batches(kwargs) -> set:
-	from erpnext.stock.doctype.batch.batch import get_batch_qty
-
 	conflicting_batches = set()
 	for row in get_cross_warehouse_sre_details(kwargs):
 		if flt(row.outstanding_qty) <= 0:
 			continue
 
-		batch_qty = get_batch_qty(
+		batch_qty = get_batch_qty_for_stock(
 			row.batch_no,
 			row.warehouse,
 			posting_date=kwargs.get("posting_date"),
