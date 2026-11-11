@@ -1963,6 +1963,32 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		dn.cancel()
 		pr1.cancel()
 
+	def test_stock_user_can_save_purchase_receipt(self):
+		from erpnext.buying.test_utils import create_user_with_roles
+
+		user = create_user_with_roles("pr-stock-user@example.com", "Stock User").name
+		with self.set_user(user):
+			pr = make_purchase_receipt(do_not_submit=True)
+
+		self.assertTrue(pr.name)
+
+	def test_purchase_user_can_submit_receipt_of_an_item_that_auto_creates_batches(self):
+		from erpnext.buying.test_utils import create_user_with_roles
+
+		item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "PUAB-.#####",
+			}
+		).name
+		user = create_user_with_roles("pr-purchase-user@example.com", "Purchase User").name
+		with self.set_user(user):
+			pr = make_purchase_receipt(item_code=item, qty=1)
+
+		self.assertTrue(get_batch_from_bundle(pr.items[0].serial_and_batch_bundle))
+
 	def test_warehouse_restricted_user_gets_items_from_internal_delivery_note(self):
 		from frappe.permissions import add_user_permission
 
@@ -7088,6 +7114,28 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		)
 
 		self.assertTrue(sles)
+
+		repost_doc = frappe.get_doc(
+			{
+				"doctype": "Repost Item Valuation",
+				"based_on": "Transaction",
+				"voucher_type": pr.doctype,
+				"voucher_no": pr.name,
+				"posting_date": pr.posting_date,
+				"posting_time": pr.posting_time,
+				"company": pr.company,
+				"recreate_stock_ledgers": 1,
+			}
+		)
+
+		self.assertRaises(frappe.ValidationError, repost_doc.save)
+
+	def test_validate_recreate_stock_ledgers_for_batch_item_without_stock_ledger_entries(self):
+		item_code = make_item(
+			properties={"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-TRSLR-.#####"}
+		).name
+		pr = make_purchase_receipt(item_code=item_code, qty=10, rate=100)
+		frappe.db.delete("Stock Ledger Entry", {"voucher_type": pr.doctype, "voucher_no": pr.name})
 
 		repost_doc = frappe.get_doc(
 			{

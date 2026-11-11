@@ -1297,11 +1297,12 @@ class update_entries_after:
 				).format(bold(sle.item_code), bold(self.company), bold(sle.posting_date))
 			)
 
-		# an adjustment entry moves stock rather than setting a balance
+		# an adjustment entry or a bundle leg moves stock rather than setting a balance
 		if (
 			sle.voucher_type == "Stock Reconciliation"
 			and sle.get("qty_after_transaction") is not None
 			and not sle.is_adjustment_entry
+			and not sle.serial_and_batch_bundle
 		):
 			self.wh_data.qty_after_transaction = flt(sle.qty_after_transaction)
 		else:
@@ -1707,6 +1708,18 @@ class update_entries_after:
 			if key in sle:
 				del sle[key]
 
+	def get_reserved_stock_to_keep(self, sle):
+		"""Reserved qty this entry must leave in the warehouse.
+
+		A serial / batch reconciliation takes out its current qty and puts the counted qty back,
+		so only the reserved qty beyond the counted qty must stay."""
+		reserved_stock = flt(self.get_reserved_stock(sle.item_code, sle.warehouse))
+		if not reserved_stock or sle.voucher_type != "Stock Reconciliation" or flt(sle.actual_qty) >= 0:
+			return reserved_stock
+
+		counted_qty = frappe.db.get_value("Stock Reconciliation Item", sle.voucher_detail_no, "qty")
+		return max(reserved_stock - flt(counted_qty), 0)
+
 	def get_outgoing_rate_for_batched_item(self, sle):
 		if self.wh_data.qty_after_transaction == 0:
 			return 0
@@ -1718,11 +1731,7 @@ class update_entries_after:
 		validate negative stock for entries current datetime onwards
 		will not consider cancelled entries
 		"""
-		diff = (
-			self.wh_data.qty_after_transaction
-			+ flt(sle.actual_qty)
-			- flt(self.get_reserved_stock(sle.item_code, sle.warehouse))
-		)
+		diff = self.wh_data.qty_after_transaction + flt(sle.actual_qty) - self.get_reserved_stock_to_keep(sle)
 		diff = flt(diff, self.flt_precision)  # respect system precision
 
 		diff_threshold = 0.0001
@@ -2415,11 +2424,13 @@ class update_entries_after:
 					allowed_qty = abs(exceptions[0]["actual_qty"]) - abs(exceptions[0]["diff"])
 
 					if allowed_qty > 0:
-						msg = "{} As {} units are reserved for other sales orders, you are allowed to consume only {} units.".format(
-							msg, frappe.bold(reserved_stock), frappe.bold(allowed_qty)
-						)
+						msg = _(
+							"{0} As {1} units are reserved for other sales orders, you are allowed to consume only {2} units."
+						).format(msg, frappe.bold(reserved_stock), frappe.bold(allowed_qty))
 					else:
-						msg = f"{msg} As the full stock is reserved for other transactions, you're not allowed to consume the stock."
+						msg = _(
+							"{0} As the full stock is reserved for other transactions, you're not allowed to consume the stock."
+						).format(msg)
 
 				msg_list.append(msg)
 
@@ -2886,7 +2897,8 @@ def update_qty_in_future_sle(args, allow_negative_stock=False):
 		# shifts future balances — no full repost is needed. Update qty and value in place:
 		# stock_value = qty_after_transaction * standard rate, which is constant across this range
 		# (a rate change posts a reconciliation that bounds it). stock_value_difference is unchanged
-		# because every future balance shifts by the same amount.
+		# because every future balance shifts by the same amount; the bounding reconciliation is
+		# not shifted and gets its difference recomputed by the repost queued for it.
 		from erpnext.stock.doctype.item_standard_cost.item_standard_cost import get_item_standard_rate
 
 		standard_rate = flt(
@@ -3032,6 +3044,10 @@ def get_next_stock_reco(kwargs):
 		.limit(1)
 	)
 
+	# The caller's UPDATE shifts the latest committed rows, so find the bounding reco among them too.
+	if frappe.db.db_type == "mariadb":
+		query = query.for_update()
+
 	return query.run(as_dict=True)
 
 
@@ -3044,17 +3060,17 @@ def get_datetime_limit_condition(sle, detail):
 
 
 def validate_negative_qty_in_future_sle(args, allow_negative_stock=False):
-	if allow_negative_stock or is_negative_stock_allowed(item_code=args.item_code):
-		if not allow_negative_stock and is_reserved_stock_drawn(args):
-			validate_reserved_stock(args)
-		return
-
 	if (
 		args.voucher_type == "Stock Reconciliation"
 		and args.actual_qty < 0
 		and args.get("serial_and_batch_bundle")
-		and frappe.db.get_value("Stock Reconciliation Item", args.voucher_detail_no, "qty") > 0
+		and flt(frappe.db.get_value("Stock Reconciliation Item", args.voucher_detail_no, "qty")) > 0
 	):
+		return
+
+	if allow_negative_stock or is_negative_stock_allowed(item_code=args.item_code):
+		if not allow_negative_stock and is_reserved_stock_drawn(args):
+			validate_reserved_stock(args)
 		return
 
 	if args.actual_qty >= 0 and args.voucher_type != "Stock Reconciliation":

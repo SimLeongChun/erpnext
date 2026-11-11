@@ -210,10 +210,50 @@ class SerialBatchBundle:
 				"is_packed": self.is_packed_entry(),
 				"make_bundle_from_sle": 1,
 				"sle": self.sle,
+				**self.get_entries_held_by_voucher(),
 			}
 		).make_serial_and_batch_bundle()
 
 		self.set_serial_and_batch_bundle(sn_doc)
+
+	def get_entries_held_by_voucher(self):
+		"""Serial nos and batch qty that draft bundles on this voucher's rows hold, to skip when picking."""
+		if self.sle.actual_qty > 0:
+			return {}
+
+		bundle = frappe.qb.DocType("Serial and Batch Bundle")
+		entry = frappe.qb.DocType("Serial and Batch Entry")
+		entries = (
+			frappe.qb.from_(bundle)
+			.inner_join(entry)
+			.on(entry.parent == bundle.name)
+			.select(entry.serial_no, entry.batch_no, entry.qty, bundle.warehouse)
+			.where(
+				(
+					bundle.name.isin(self.get_bundles_on_voucher_rows(self.child_doctype))
+					| bundle.name.isin(self.get_bundles_on_voucher_rows("Packed Item"))
+				)
+				& (bundle.item_code == self.item_code)
+				& (bundle.type_of_transaction == "Outward")
+				& (bundle.docstatus == 0)
+			)
+		).run(as_dict=True)
+
+		held_batches = frappe._dict()
+		add_picked_batches(held_batches, entries)
+
+		return {
+			"ignore_serial_nos": [row.serial_no for row in entries if row.serial_no],
+			"already_picked_batches": held_batches,
+		}
+
+	def get_bundles_on_voucher_rows(self, doctype):
+		row = frappe.qb.DocType(doctype)
+		return (
+			frappe.qb.from_(row)
+			.select(row.serial_and_batch_bundle)
+			.where((row.parenttype == self.sle.voucher_type) & (row.parent == self.sle.voucher_no))
+		)
 
 	def validate_actual_qty(self, sn_doc):
 		link = get_link_to_form("Serial and Batch Bundle", sn_doc.name)
@@ -1361,6 +1401,9 @@ class SerialBatchCreation:
 
 		if self.get("already_picked_batches"):
 			kwargs["already_picked_batches"] = self.already_picked_batches
+			if self.get("voucher_type") == "POS Invoice":
+				# a submitted POS Invoice's own reserved batch qty is already in already_picked_batches
+				kwargs["ignore_voucher_nos"] = [self.voucher_no]
 
 		kwargs.update(self.get_reservation_kwargs())
 
@@ -1699,3 +1742,13 @@ def get_serial_batch_list_from_item(item):
 		batch_list = [item.batch_no] if item.get("batch_no") else []
 
 	return serial_list, batch_list
+
+
+def add_picked_batches(picked_batches, entries):
+	for entry in entries:
+		if entry.batch_no:
+			picked = picked_batches.setdefault(
+				(entry.batch_no, entry.warehouse),
+				frappe._dict(batch_no=entry.batch_no, warehouse=entry.warehouse, qty=0),
+			)
+			picked.qty += entry.qty
