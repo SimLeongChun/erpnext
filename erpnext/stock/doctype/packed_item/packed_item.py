@@ -447,11 +447,11 @@ def get_order_packed_item_pairs(doc) -> list[tuple]:
 
 
 def update_packed_item_with_pick_list_info(main_item_row, pi_row, so_packed_item=None):
-	from erpnext.stock.doctype.pick_list.mapper import get_pending_serial_nos, get_serial_nos_in_stock
+	from erpnext.stock.doctype.pick_list.mapper import get_pending_serial_nos
+	from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
 
 	filters = {
 		"item_code": pi_row.item_code,
-		"sales_order": main_item_row.get("against_sales_order"),
 		"sales_order_item": main_item_row.get("so_detail"),
 		"parent": main_item_row.against_pick_list,
 	}
@@ -462,7 +462,7 @@ def update_packed_item_with_pick_list_info(main_item_row, pi_row, so_packed_item
 	pl_rows = frappe.get_all(
 		"Pick List Item",
 		filters,
-		["item_code", "warehouse", "batch_no", "serial_no", "picked_qty", "delivered_qty"],
+		["name", "item_code", "warehouse", "batch_no", "serial_no", "picked_qty", "delivered_qty"],
 		# name tiebreaker: split pick-list rows can tie on qty -> pick the same warehouse/batch/serial on both engines
 		order_by="qty desc, name asc",
 	)
@@ -472,15 +472,38 @@ def update_packed_item_with_pick_list_info(main_item_row, pi_row, so_packed_item
 
 	# a component picked from several warehouses moves on to the rows not delivered yet
 	precision = frappe.get_precision("Pick List Item", "delivered_qty")
+	pending_rows = [row for row in pl_rows if flt(row.picked_qty - row.delivered_qty, precision) > 0]
+	pending_rows = pending_rows or pl_rows
+	# kept serial nos stay on the pick list row they were mapped from
+	kept_serial_nos = {number.lower() for number in get_serial_nos(pi_row.serial_no)}
 	pl_row = next(
-		(row for row in pl_rows if flt(row.picked_qty - row.delivered_qty, precision) > 0), pl_rows[0]
+		(
+			row
+			for row in pending_rows
+			if kept_serial_nos & {number.lower() for number in get_serial_nos(row.serial_no)}
+		),
+		pending_rows[0],
 	)
 
 	pi_row.warehouse = pl_row.warehouse
 	pi_row.batch_no = pl_row.batch_no
 	# keep the serial nos picked on the packed row for a partial delivery
 	if not pi_row.serial_no:
-		pi_row.serial_no = get_pending_serial_nos(pl_row, get_serial_nos_in_stock([pl_row]))
+		delivered = (
+			get_delivered_component_serial_nos(main_item_row, pl_row)
+			if pl_row.serial_no and pl_row.delivered_qty
+			else set()
+		)
+		pi_row.serial_no = get_pending_serial_nos(pl_row, {pl_row.name: delivered})
+
+
+def get_delivered_component_serial_nos(main_item_row, pl_row):
+	"""Lower-cased serial nos that submitted deliveries of the pick list took from a component location."""
+	from erpnext.stock.doctype.pick_list.pick_list import get_delivered_bundle_component_qty
+
+	so_detail = main_item_row.get("so_detail")
+	delivered_serial_nos = get_delivered_bundle_component_qty(main_item_row.against_pick_list, {so_detail})[1]
+	return delivered_serial_nos[(so_detail, pl_row.item_code, pl_row.warehouse, pl_row.batch_no or "")]
 
 
 def update_packed_item_price_data(pi_row, item_data, doc):
