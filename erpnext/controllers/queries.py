@@ -7,7 +7,6 @@ from collections import OrderedDict, defaultdict
 
 import frappe
 from frappe import _, qb
-from frappe.permissions import has_permission
 from frappe.query_builder import Case, Criterion, DocType
 from frappe.query_builder.functions import (
 	Cast_,
@@ -49,13 +48,9 @@ def employee_query(
 ):
 	doctype = "Employee"
 	fields = get_fields(doctype, ["name", "employee_name"])
-	ignore_permissions = False
-
-	if reference_doctype and ignore_user_permissions:
-		ignore_permissions = has_ignored_field(reference_doctype, doctype) and has_permission(
-			doctype,
-			ptype="select" if frappe.only_has_select_perm(doctype) else "read",
-		)
+	ignore_user_permissions = bool(
+		reference_doctype and ignore_user_permissions and has_ignored_field(reference_doctype, doctype)
+	)
 
 	Employee = frappe.qb.DocType("Employee")
 	search_str = f"%{txt}%"
@@ -67,7 +62,8 @@ def employee_query(
 		"Employee",
 		fields=fields,
 		filters=filters,
-		ignore_permissions=ignore_permissions,
+		ignore_permissions=False,
+		ignore_user_permissions=ignore_user_permissions,
 	)
 
 	query = (
@@ -716,6 +712,7 @@ def get_delivery_notes_to_be_received(
 @frappe.validate_and_sanitize_search_inputs
 def get_batch_no(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	doctype = "Batch"
+	frappe.has_permission(doctype, "select", throw=True)
 	meta = frappe.get_meta(doctype, cached=True)
 	searchfields = [field for field in meta.get_search_fields() if field not in ("name", "batch_id")]
 	page_len = 300
@@ -731,7 +728,7 @@ def get_batch_no(doctype: str, txt: str, searchfield: str, start: int, page_len:
 	if not filtered_batches:
 		return []
 	numbers = dict(
-		frappe.get_all(
+		frappe.get_list(
 			"Batch",
 			filters={"name": ("in", [row[0] for row in filtered_batches]), "item": filters.get("item_code")},
 			fields=["name", "batch_id"],
@@ -1140,26 +1137,24 @@ def warehouse_query(doctype: str, txt: str, searchfield: str, start: int, page_l
 
 	# Base the query on Warehouse so get_query applies its user-permission match conditions;
 	# Bin is left-joined (its filters on the JOIN) so warehouses without a Bin row still match.
-	query = (
-		frappe.qb.get_query("Warehouse", fields=[warehouse_field], ignore_permissions=False)
-		.left_join(bin_dt)
-		.on(join_condition)
-		.select(
-			Concat("Actual Qty", " : ", IfNull(Round(bin_dt.actual_qty, 2), 0)).as_("actual_qty"),
-		)
-		.where(wh[searchfield].like(f"%{txt}%"))
+	query = frappe.qb.get_query("Warehouse", fields=[warehouse_field], ignore_permissions=False).where(
+		wh[searchfield].like(f"%{txt}%")
 	)
+
+	if frappe.has_permission("Bin", "read"):
+		query = (
+			query.left_join(bin_dt)
+			.on(join_condition)
+			.select(
+				Concat("Actual Qty", " : ", IfNull(Round(bin_dt.actual_qty, 2), 0)).as_("actual_qty"),
+			)
+			.orderby(IfNull(bin_dt.actual_qty, 0), order=Order.desc)
+		)
 
 	for condition in get_filter_conditions_qb("Warehouse", filter_dict.get("Warehouse")):
 		query = query.where(condition)
 
-	return (
-		query.orderby(IfNull(bin_dt.actual_qty, 0), order=Order.desc)
-		.orderby(wh[warehouse_field], order=Order.asc)
-		.limit(page_len)
-		.offset(start)
-		.run()
-	)
+	return query.orderby(wh[warehouse_field], order=Order.asc).limit(page_len).offset(start).run()
 
 
 def get_doctype_wise_filters(filters):
@@ -1191,9 +1186,14 @@ def get_batch_numbers(doctype: str, txt: str, searchfield: str, start: int, page
 def item_manufacturer_query(
 	doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict
 ):
+	item_code = filters.get("item_code")
+	if not item_code or not isinstance(item_code, str):
+		return []
+
+	frappe.has_permission("Item", "read", item_code, throw=True)
 	item_filters = [
 		["manufacturer", "like", "%" + txt + "%"],
-		["item_code", "=", filters.get("item_code")],
+		["item_code", "=", item_code],
 	]
 
 	item_manufacturers = frappe.get_all(
@@ -1479,6 +1479,11 @@ def get_item_uom_query(doctype: str, txt: str, searchfield: str, start: int, pag
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
 def get_warehouse_address(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
+	warehouse = filters.get("warehouse")
+	if not warehouse or not isinstance(warehouse, str):
+		return []
+
+	frappe.has_permission("Warehouse", "read", warehouse, throw=True)
 	table = frappe.qb.DocType(doctype)
 	child_table = frappe.qb.DocType("Dynamic Link")
 
@@ -1488,7 +1493,7 @@ def get_warehouse_address(doctype: str, txt: str, searchfield: str, start: int, 
 		.on((table.name == child_table.parent) & (child_table.parenttype == doctype))
 		.select(table.name)
 		.where(
-			(child_table.link_name == filters.get("warehouse"))
+			(child_table.link_name == warehouse)
 			& (table.disabled == 0)
 			& (child_table.link_doctype == "Warehouse")
 			& (table.name.like(f"%{txt}%"))

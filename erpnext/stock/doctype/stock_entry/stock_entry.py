@@ -7,8 +7,10 @@ from collections import defaultdict
 
 import frappe
 from frappe import _
+from frappe.core.doctype.user_permission.user_permission import get_user_permissions
 from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
+from frappe.permissions import get_allowed_docs_for_doctype
 from frappe.query_builder.functions import Sum
 from frappe.utils import (
 	cint,
@@ -42,6 +44,7 @@ from erpnext.stock.utils import (
 	check_company,
 	check_warehouse_company,
 	get_combine_datetime,
+	validate_warehouse_company,
 )
 
 from .services.disassemble import DisassembleStockEntry
@@ -351,9 +354,12 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 		sbb = SerialBatchBundleService(self)
 
+		self.validate_reference_companies()
+		self.validate_row_reference_parents()
 		if self.purpose_cls:
 			self.purpose_cls(self).validate()
 
+		self.validate_warehouses_company()
 		sbb.validate_duplicate_serial_and_batch_bundle("items")
 		self.validate_posting_time()
 		self.validate_item()
@@ -413,6 +419,67 @@ class StockEntry(StockController, SubcontractingInwardController):
 	def remove_fg_completed_qty(self):
 		if not self.from_bom and not self.work_order and self.fg_completed_qty:
 			self.fg_completed_qty = 0.0
+
+	def validate_reference_companies(self):
+		for doctype, names in self.get_referenced_documents().items():
+			if other_company_document := frappe.get_all(
+				doctype,
+				filters={"name": ("in", list(names)), "company": ("!=", self.company)},
+				pluck="name",
+				limit=1,
+			):
+				frappe.throw(
+					_("{0} {1} does not belong to Company {2}").format(
+						_(doctype), other_company_document[0], self.company
+					)
+				)
+
+	def validate_row_reference_parents(self):
+		for row_field, child_doctype, parent_field in (
+			("pick_list_item", "Pick List Item", "pick_list"),
+			("job_card_item", "Job Card Item", "job_card"),
+		):
+			names = {row.get(row_field) for row in self.items if row.get(row_field)}
+			parent = self.get(parent_field) or ""
+			if names and (
+				other_parent_row := frappe.get_all(
+					child_doctype,
+					filters={"name": ("in", list(names)), "parent": ("!=", parent)},
+					pluck="name",
+					limit=1,
+				)
+			):
+				frappe.throw(
+					_("{0} {1} does not belong to {2} {3}").format(
+						_(child_doctype),
+						other_parent_row[0],
+						_(self.meta.get_label(parent_field)),
+						parent,
+					)
+				)
+
+	def get_referenced_documents(self):
+		references = defaultdict(set)
+		for fieldname in (
+			"work_order",
+			"job_card",
+			"pick_list",
+			"purchase_order",
+			"subcontracting_order",
+			"subcontracting_inward_order",
+			"outgoing_stock_entry",
+			"source_stock_entry",
+		):
+			if name := self.get(fieldname):
+				references[self.meta.get_options(fieldname)].add(name)
+
+		for row in self.get("items"):
+			if row.material_request:
+				references["Material Request"].add(row.material_request)
+			if row.against_stock_entry:
+				references["Stock Entry"].add(row.against_stock_entry)
+
+		return references
 
 	def before_submit(self):
 		if self.purpose_cls and hasattr(self.purpose_cls, "before_submit"):
@@ -591,13 +658,22 @@ class StockEntry(StockController, SubcontractingInwardController):
 					title=_("Work Order Mismatch"),
 				)
 
+	def validate_warehouses_company(self):
+		warehouses = {d.s_warehouse for d in self.get("items")} | {d.t_warehouse for d in self.get("items")}
+		for warehouse in warehouses - {None, ""}:
+			validate_warehouse_company(warehouse, self.company)
+
 	def set_actual_qty(self):
+		self.validate_warehouses_company()
 		for d in self.get("items"):
 			d.set_actual_qty(self.posting_date, self.posting_time)
 
 	@frappe.whitelist()
 	def get_stock_and_rate(self):
+		self.check_source_documents_permission()
 		self.set_work_order_details()
+		if self.bom_no:
+			erpnext.require_permission("BOM", self.bom_no)
 		self.set_transfer_qty()
 		self.set_actual_qty()
 		self.calculate_rate_and_amount()
@@ -1672,6 +1748,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		if self.purpose in ("Manufacture", "Repack") and self.from_bom and not flt(self.fg_completed_qty):
 			frappe.throw(_("Please set Finished Good Quantity before fetching items from the BOM."))
 
+		self.check_source_documents_permission()
 		self.set("items", [])
 		if self.purpose_cls and hasattr(self.purpose_cls, "add_items"):
 			self.purpose_cls(self).add_items()
@@ -1680,6 +1757,15 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.set_actual_qty()
 		self.validate_customer_provided_item()
 		self.calculate_rate_and_amount(raise_error_if_no_rate=False)
+
+	def check_source_documents_permission(self):
+		for doctype, name in (
+			("Work Order", self.work_order),
+			("BOM", self.bom_no),
+			("Stock Entry", self.source_stock_entry),
+		):
+			if name:
+				erpnext.require_permission(doctype, name)
 
 	def set_serial_batch_from_reserved_entry(self):
 		StockEntrySABB(self).set_serial_batch_based_on_reservation()
@@ -2275,13 +2361,12 @@ def get_warehouse_details(args: str | dict):
 
 	args = frappe._dict(args)
 
-	# Restored explicitly: both checks were inherited from get_incoming_rate until it was split into
-	# a guarded whitelist wrapper and the unguarded _get_incoming_rate this now calls.
-	# `select`, not `read`: this is reached from stock_entry.js:740, and the desk roles that open
-	# that form clear select through the Desk User row while holding no Item read of their own.
-	frappe.has_permission("Item", ptype="select", throw=True)
+	frappe.has_permission("Stock Entry", "read", throw=True)
 	check_warehouse_company(args.get("warehouse"))
 	check_company(args.get("company"))
+	if args.warehouse:
+		erpnext.require_user_permission("Warehouse", args.warehouse)
+		check_stock_entry_warehouse_permission(args.warehouse)
 
 	ret = {}
 	if args.warehouse and args.item_code:
@@ -2296,3 +2381,10 @@ def get_warehouse_details(args: str | dict):
 			"basic_rate": _get_incoming_rate(args),
 		}
 	return ret
+
+
+def check_stock_entry_warehouse_permission(warehouse: str) -> None:
+	permissions = get_user_permissions().get("Warehouse", [])
+	allowed_warehouses = get_allowed_docs_for_doctype(permissions, "Stock Entry")
+	if allowed_warehouses and warehouse not in allowed_warehouses:
+		frappe.throw(_("Not permitted for {0}").format(warehouse), frappe.PermissionError)
