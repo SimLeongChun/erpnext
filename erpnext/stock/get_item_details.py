@@ -398,7 +398,8 @@ def set_serial_nos_for_outward(ctx, out, kwargs, doc):
 	if out.has_batch_no and batch_no:
 		kwargs["batches"] = [batch_no]
 
-	serial_nos = get_filtered_serial_nos(get_serial_nos_for_outward(kwargs), doc)
+	kwargs["ignore_serial_nos"] = [*(kwargs.get("ignore_serial_nos") or []), *get_used_serial_nos(doc)]
+	serial_nos = get_serial_nos_for_outward(kwargs)
 	out["serial_no"] = "\n".join(
 		SerialBatchIdentity("Serial No").get_numbers(ctx.item_code, serial_nos[: cint(out.stock_qty)])
 	)
@@ -433,14 +434,37 @@ def get_batch_no_covering_qty(kwargs, doc, qty):
 
 def filter_batches(batches, doc, item_code, warehouse):
 	precision = frappe.get_precision("Serial and Batch Entry", "qty")
-	for row in [*doc.get("items"), *(doc.get("packed_items") or [])]:
-		batch_no = row.get("batch_no")
-		# a later row without a warehouse yet may get this one from set_warehouse, item or POS defaults
-		if batch_no in batches and row.get("warehouse") in (None, "", warehouse):
-			stock_qty = flt(get_row_stock_qty(row, item_code), precision)
-			batches[batch_no] = flt(batches[batch_no] - stock_qty, precision)
+	for batch_no, stock_qty in get_batch_qty_taken_by_rows(doc, item_code, warehouse):
+		if batch_no in batches:
+			batches[batch_no] = flt(batches[batch_no] - flt(stock_qty, precision), precision)
 			if batches[batch_no] <= 0:
 				del batches[batch_no]
+
+
+def get_batch_qty_taken_by_rows(doc, item_code, warehouse):
+	"""(batch_no, stock_qty) the warehouse's rows take by batch_no or, without one, by Serial and Batch Bundle."""
+	# a later row without a warehouse yet may get this one from set_warehouse, item or POS defaults
+	rows = [
+		row
+		for row in [*doc.get("items"), *(doc.get("packed_items") or [])]
+		if row.get("warehouse") in (None, "", warehouse)
+	]
+	taken = [(row.get("batch_no"), get_row_stock_qty(row, item_code)) for row in rows if row.get("batch_no")]
+
+	bundles = [
+		row.get("serial_and_batch_bundle")
+		for row in rows
+		if not row.get("batch_no") and row.get("serial_and_batch_bundle")
+	]
+	if bundles:
+		entries = frappe.get_all(
+			"Serial and Batch Entry",
+			filters={"parent": ["in", bundles], "batch_no": ["is", "set"]},
+			fields=["batch_no", "qty"],
+		)
+		taken.extend((entry.batch_no, abs(entry.qty)) for entry in entries)
+
+	return taken
 
 
 def get_row_stock_qty(row, item_code):
@@ -461,10 +485,17 @@ def get_uom_conversion_factor(item_code, uom):
 
 
 def get_filtered_serial_nos(serial_nos, doc, table=None):
+	used = get_used_serial_nos(doc, table)
+	return [serial_no for serial_no in serial_nos if serial_no not in used]
+
+
+def get_used_serial_nos(doc, table=None):
+	"""Serial No records held by the rows of ``table``, or of the items and packed items."""
 	from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
 
+	rows = doc.get(table) if table else [*doc.get("items"), *(doc.get("packed_items") or [])]
 	numbers_by_item = defaultdict(list)
-	for row in doc.get(table or "items"):
+	for row in rows:
 		item_code = row.get("item_code") or row.get("rm_item_code")
 		if item_code and row.get("serial_no"):
 			numbers_by_item[item_code].extend(get_serial_nos(row.get("serial_no")))
@@ -474,7 +505,7 @@ def get_filtered_serial_nos(serial_nos, doc, table=None):
 		records = SerialBatchIdentity("Serial No").get_records(item_code, numbers, ["name"])
 		used.update(record.name for record in records)
 
-	return [serial_no for serial_no in serial_nos if serial_no not in used]
+	return used
 
 
 def update_bin_details(ctx: frappe._dict, out: frappe._dict, doc):
@@ -732,7 +763,9 @@ def get_basic_details(ctx: frappe._dict, item, overwrite_warehouse=True) -> frap
 		).get("conversion_factor")
 
 	ctx.conversion_factor = out.conversion_factor
-	out.stock_qty = out.qty * out.conversion_factor
+	out.stock_qty = flt(
+		out.qty * out.conversion_factor, frappe.get_precision(f"{ctx.doctype} Item", "stock_qty")
+	)
 	ctx.stock_qty = out.stock_qty
 
 	# calculate last purchase rate
