@@ -10,7 +10,7 @@ from frappe.permissions import (
 	remove_user_permission,
 )
 from frappe.query_builder import Criterion
-from frappe.utils import cint, cstr, getdate, today, validate_email_address
+from frappe.utils import cint, cstr, get_link_to_form, getdate, today, validate_email_address
 from frappe.utils.nestedset import NestedSet
 
 import erpnext
@@ -140,6 +140,7 @@ class Employee(NestedSet):
 		):
 			if frappe.db.get_value("Department", self.department, "disabled"):
 				frappe.throw(_("Cannot assign a disabled Department"))
+		self.validate_department_company()
 		self.set_preferred_email()
 		self.validate_preferred_email()
 
@@ -167,7 +168,9 @@ class Employee(NestedSet):
 			return
 
 		self.validate_for_enabled_user_id()
-		self.validate_duplicate_user_id()
+		# An old Left record keeps its link to the rehire's User, but no new link may be made.
+		if self.status == "Active" or self.has_value_changed("user_id"):
+			self.validate_duplicate_user_id()
 		if any(
 			self.has_value_changed(field) for field in ("user_id", "status", "create_user_permission")
 		) or (self.create_user_permission and self.has_value_changed("company")):
@@ -203,10 +206,17 @@ class Employee(NestedSet):
 		self.update_nsm_model()
 		self.release_previous_user()
 		if self.user_id:
-			self.update_user()
+			active_rehire = self.status != "Active" and frappe.db.exists(
+				"Employee", {"user_id": self.user_id, "status": "Active", "name": ["!=", self.name]}
+			)
+			if not active_rehire:
+				self.update_user()
 			self.update_user_permissions()
-			self.update_user_status()
+			if not active_rehire:
+				self.update_user_status()
 		self.reset_employee_emails_cache()
+		if self.status == "Left" and self.has_value_changed("status"):
+			disable_sales_persons(self.name)
 
 	def before_insert(self):
 		self.validate_auto_user_creation()
@@ -236,27 +246,50 @@ class Employee(NestedSet):
 			return
 
 		previous = self.get_doc_before_save()
-		if previous.create_user_permission:
-			self.remove_user_permissions(previous_user_id, previous.company)
-		else:
-			remove_user_permission("Employee", self.name, previous_user_id, ignore_permissions=True)
-
-		user = frappe.get_doc("User", previous_user_id)
+		self.remove_user_access(previous_user_id, previous.company, previous.create_user_permission)
 		# The saved Employee no longer links to the User, so this checks only other employees.
-		validate_employee_role(user)
-		user.save(ignore_permissions=True)
+		remove_employee_role(previous_user_id)
+
+	def remove_user_access(self, user, company, create_user_permission):
+		if create_user_permission:
+			self.remove_user_permissions(user, company)
+		else:
+			remove_user_permission("Employee", self.name, user, ignore_permissions=True)
 
 	def remove_user_permissions(self, user, company, include_employee=True):
 		"""Remove the User Permissions that Create User Permission adds."""
+		company_permission = self.get_added_company_permission(user, company)
 		if include_employee:
 			remove_user_permission("Employee", self.name, user, ignore_permissions=True)
 
 		# Another Employee of the same User and Company still needs the Company restriction.
-		if not frappe.db.exists(
+		if company_permission and not frappe.db.exists(
 			"Employee",
 			{"user_id": user, "company": company, "create_user_permission": 1, "name": ("!=", self.name)},
 		):
-			remove_user_permission("Company", company, user, ignore_permissions=True)
+			frappe.delete_doc("User Permission", company_permission, force=True, ignore_permissions=True)
+
+	def get_added_company_permission(self, user, company):
+		"""Return the Company User Permission that Create User Permission added for this Employee.
+
+		User Permission does not record who made it. Create User Permission adds the Employee permission
+		first, so a Company permission made before it was set up by hand.
+		"""
+		employee_permission_created = frappe.db.get_value(
+			"User Permission", {"allow": "Employee", "for_value": self.name, "user": user}, "creation"
+		)
+		if not employee_permission_created:
+			return None
+
+		return frappe.db.get_value(
+			"User Permission",
+			{
+				"allow": "Company",
+				"for_value": company,
+				"user": user,
+				"creation": (">=", employee_permission_created),
+			},
+		)
 
 	def update_user_permissions(self):
 		if not any(
@@ -335,7 +368,7 @@ class Employee(NestedSet):
 		self.prefered_email = self.get(preferred_email_field) if preferred_email_field else None
 
 	def validate_status(self):
-		if self.status == "Left":
+		if self.status != "Active" and self.has_value_changed("status"):
 			reports_to = frappe.db.get_all(
 				"Employee",
 				filters={"reports_to": self.name, "status": "Active"},
@@ -352,9 +385,9 @@ class Employee(NestedSet):
 				message += "<br><br><ul><li>" + "</li><li>".join(link_to_employees)
 				message += "</li></ul><br>"
 				message += _("Please make sure the employees above report to another Active employee.")
-				throw(message, InactiveEmployeeStatusError, _("Cannot Relieve Employee"))
-			if not self.relieving_date:
-				throw(_("Please enter relieving date."))
+				throw(message, InactiveEmployeeStatusError, _("Cannot Deactivate Employee"))
+		if self.status == "Left" and not self.relieving_date:
+			throw(_("Please enter relieving date."))
 
 	def validate_for_enabled_user_id(self):
 		if not frappe.db.exists("User", self.user_id):
@@ -423,10 +456,34 @@ class Employee(NestedSet):
 	def validate_reports_to(self):
 		if self.reports_to == self.name:
 			throw(_("Employee cannot report to himself."))
+		if (
+			self.status == "Active"
+			and self.reports_to
+			and (self.has_value_changed("status") or self.has_value_changed("reports_to"))
+		):
+			if frappe.db.get_value("Employee", self.reports_to, "status") != "Active":
+				throw(_("An Active employee must report to an Active employee."))
+
+	def validate_department_company(self):
+		if self.department and (self.has_value_changed("department") or self.has_value_changed("company")):
+			department_company = frappe.db.get_value("Department", self.department, "company")
+			if department_company and department_company != self.company:
+				frappe.throw(
+					_("Department {0} does not belong to Company {1}").format(
+						frappe.bold(self.department), frappe.bold(self.company)
+					)
+				)
 
 	def on_trash(self):
 		self.update_nsm_model()
 		delete_events(self.doctype, self.name)
+		if self.user_id:
+			self.validate_user_access()
+			self.remove_user_access(self.user_id, self.company, self.create_user_permission)
+
+	def after_delete(self):
+		if self.user_id:
+			remove_employee_role(self.user_id)
 
 	def validate_preferred_email(self):
 		if self.prefered_contact_email and not self.get(scrub(self.prefered_contact_email)):
@@ -448,6 +505,13 @@ def get_admin_roles() -> set[str]:
 			perm.role for perm in frappe.get_meta(doctype).permissions if perm.write and not perm.permlevel
 		)
 	return roles
+
+
+def remove_employee_role(user_id):
+	"""Remove the Employee roles from the User when no Employee links to it."""
+	user = frappe.get_doc("User", user_id)
+	validate_employee_role(user)
+	user.save(ignore_permissions=True)
 
 
 def validate_employee_role(doc, method=None, ignore_emp_check=False):
@@ -541,7 +605,14 @@ def get_holiday_list_for_employee(employee, raise_exception=True, as_on=None):
 	if hrms_override:
 		return frappe.get_attr(hrms_override[-1])(employee, raise_exception, as_on)
 	if employee:
-		holiday_list, company = frappe.get_cached_value("Employee", employee, ["holiday_list", "company"])
+		employee_details = frappe.get_cached_value("Employee", employee, ["holiday_list", "company"])
+		if not employee_details:
+			if raise_exception:
+				frappe.throw(
+					_("Employee {0} not found").format(frappe.bold(employee)), frappe.DoesNotExistError
+				)
+			return None
+		holiday_list, company = employee_details
 	else:
 		holiday_list = ""
 		company = frappe.db.get_single_value("Global Defaults", "default_company")
@@ -588,10 +659,28 @@ def is_holiday(employee, date=None, raise_exception=True, only_non_weekly=False,
 @frappe.whitelist()
 def deactivate_sales_person(status: str, employee: str):
 	frappe.has_permission("Employee", doc=employee, ptype="write", throw=True)
-	if status == "Left":
-		sales_person = frappe.db.get_value("Sales Person", {"employee": employee})
-		if sales_person:
-			frappe.db.set_value("Sales Person", sales_person, "enabled", 0)
+	if status == "Left" and frappe.db.get_value("Employee", employee, "status") == "Left":
+		disable_sales_persons(employee)
+
+
+def disable_sales_persons(employee: str):
+	"""Disable the Employee's Sales Persons. Keep one enabled while its open sales still need it."""
+	kept = []
+	for name in frappe.get_all("Sales Person", filters={"employee": employee, "enabled": 1}, pluck="name"):
+		sales_person = frappe.get_doc("Sales Person", name)
+		# A disabled Sales Person blocks the follow-up documents of its open sales.
+		if reason := sales_person.get_disable_blocker():
+			kept.append(f"<li>{get_link_to_form('Sales Person', name)}: {reason}</li>")
+			continue
+		sales_person.db_set("enabled", 0)
+
+	if kept:
+		frappe.msgprint(
+			_("These Sales Persons stay enabled. Reassign their work, then disable them:")
+			+ f"<ul>{''.join(kept)}</ul>",
+			title=_("Sales Persons Not Disabled"),
+			indicator="orange",
+		)
 
 
 @frappe.whitelist(methods=["POST"])
@@ -605,6 +694,12 @@ def create_user(employee: str, email: str | None = None, create_user_permission:
 		frappe.throw(_("Email is required to create a user"))
 
 	email = validate_email_address(email, True)
+	if frappe.db.exists("User", email):
+		frappe.throw(
+			_("User {0} already exists. Link the existing user to the Employee instead.").format(
+				frappe.bold(email)
+			)
+		)
 	employee_name = emp.employee_name.split(" ")
 	first_name = employee_name[0]
 	middle_name = last_name = ""

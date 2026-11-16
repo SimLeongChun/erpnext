@@ -249,21 +249,35 @@ class TestPurchaseOrder(ERPNextTestSuite):
 
 	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 1})
 	def test_receipts_for_parts_of_a_material_request_add_up_to_its_stock_qty(self):
-		item = make_item_with_fractional_box()
-		mr = make_material_request(item_code=item, qty=3, uom="Box", conversion_factor=0.666666667)
-		po = make_purchase_order(mr.name)
-		po.supplier = "_Test Supplier"
-		po.submit()
-
-		for _ in range(3):
-			pr = make_purchase_receipt(po.name)
-			pr.items[0].qty = pr.items[0].received_qty = 1
-			pr.submit()
-
-		mr.reload()
+		mr = receive_material_request_in_parts()
 		self.assertEqual(
 			mr.items[0].received_qty, flt(mr.items[0].stock_qty, mr.precision("stock_qty", "items"))
 		)
+		self.assertEqual(mr.per_received, 100)
+
+	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 0})
+	def test_receipts_for_parts_of_a_material_request_add_up_to_its_unrounded_stock_qty(self):
+		mr = receive_material_request_in_parts()
+		self.assertEqual(mr.items[0].received_qty, mr.items[0].stock_qty)
+		self.assertEqual(mr.per_received, 100)
+
+	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 0})
+	def test_receipt_of_a_material_request_in_a_whole_number_uom_completes_it(self):
+		item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"stock_uom": "Nos",
+				"uoms": [{"uom": "Box", "conversion_factor": 0.3333}],
+			}
+		).name
+		mr = make_material_request(item_code=item, qty=3, uom="Box", conversion_factor=0.3333)
+		po = make_purchase_order(mr.name)
+		po.supplier = "_Test Supplier"
+		po.submit()
+		make_purchase_receipt(po.name).submit()
+
+		mr.reload()
+		self.assertEqual(mr.items[0].received_qty, mr.items[0].stock_qty)
 		self.assertEqual(mr.per_received, 100)
 
 	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 1})
@@ -679,6 +693,47 @@ class TestPurchaseOrder(ERPNextTestSuite):
 
 		# ordered qty should decrease (back to initial) on row deletion
 		self.assertEqual(get_ordered_qty(), existing_ordered_qty)
+
+	def test_update_child_cannot_remove_returned_item(self):
+		from erpnext.controllers.sales_and_purchase_return import make_return_doc
+
+		po = create_purchase_order(do_not_save=1)
+		po.append(
+			"items",
+			{
+				"item_code": "_Test Item Home Desktop 100",
+				"qty": 1,
+				"rate": 100,
+				"warehouse": po.items[0].warehouse,
+				"schedule_date": po.schedule_date,
+			},
+		)
+		po.submit()
+		pr = make_purchase_receipt(po.name)
+		pr.submit()
+		purchase_return = make_return_doc("Purchase Receipt", pr.name)
+		purchase_return.items = purchase_return.items[1:]
+		purchase_return.submit()
+
+		kept_row = po.items[0]
+		trans_item = json.dumps(
+			[
+				{
+					"item_code": kept_row.item_code,
+					"rate": kept_row.rate,
+					"qty": kept_row.qty,
+					"docname": kept_row.name,
+				}
+			]
+		)
+		self.assertRaisesRegex(
+			frappe.ValidationError,
+			"already been received",
+			update_child_qty_rate,
+			"Purchase Order",
+			trans_item,
+			po.name,
+		)
 
 	def test_discount_amount_partial_purchase_receipt(self):
 		po = create_purchase_order(qty=4, rate=100, do_not_save=1)
@@ -2452,6 +2507,36 @@ class TestPurchaseOrder(ERPNextTestSuite):
 			frappe.db.get_value("Purchase Order", po.name, "inter_company_order_reference"), so.name
 		)
 
+	def test_row_linked_by_internal_sales_order_cannot_be_deleted(self):
+		po = make_internal_purchase_order(do_not_submit=True)
+		po.append("items", {**po.items[0].as_dict(), "name": None, "idx": None})
+		po.submit()
+
+		so = make_inter_company_sales_order(po.name)
+		so.items = [row for row in so.items if row.purchase_order_item == po.items[0].name]
+		so.items[0].delivery_date = today()
+		so.submit()
+
+		kept_row = po.items[1]
+		trans_item = json.dumps(
+			[
+				{
+					"docname": kept_row.name,
+					"item_code": kept_row.item_code,
+					"qty": kept_row.qty,
+					"rate": kept_row.rate,
+				}
+			]
+		)
+		self.assertRaisesRegex(
+			frappe.ValidationError,
+			"already ordered on Sales Order",
+			update_child_qty_rate,
+			"Purchase Order",
+			trans_item,
+			po.name,
+		)
+
 	def test_internal_sales_order_drops_buying_only_terms(self):
 		frappe.get_doc(
 			doctype="Terms and Conditions", title="_Test Buy Only Terms", buying=1, selling=0, terms="FOB"
@@ -2545,6 +2630,48 @@ class TestPurchaseOrder(ERPNextTestSuite):
 
 			orders[1].cancel()
 			self.assertFalse(source.get_db_value("inter_company_order_reference"))
+
+	def test_no_internal_sales_order_from_purchase_order_made_from_one(self):
+		from erpnext.selling.doctype.sales_order.mapper import make_inter_company_purchase_order
+		from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
+
+		so = make_sales_order(
+			company="_Test Company with perpetual inventory",
+			customer="_Test Internal Customer 2",
+			warehouse="_Test Transfer From - TCP1",
+			qty=2,
+			rate=1,
+		)
+		po = make_inter_company_purchase_order(so.name)
+		po.items[0].schedule_date = today()
+		po.submit()
+
+		self.assertRaisesRegex(
+			frappe.ValidationError, "was created from", make_inter_company_sales_order, po.name
+		)
+
+	def test_no_internal_purchase_order_from_sales_order_made_from_drop_ship_po(self):
+		from erpnext.selling.doctype.sales_order.mapper import make_inter_company_purchase_order
+		from erpnext.selling.doctype.sales_order.mapper import make_purchase_order as make_po_from_so
+		from erpnext.selling.doctype.sales_order.test_sales_order import make_sales_order
+
+		customer_so = make_sales_order(
+			company="_Test Company with perpetual inventory", warehouse="Stores - TCP1", qty=2, rate=1
+		)
+		po = make_po_from_so(
+			customer_so.name,
+			selected_items=[{"name": customer_so.items[0].name, "supplier": "_Test Internal Supplier 2"}],
+		)[0]
+		po.items[0].from_warehouse = "_Test Transfer From - TCP1"
+		po.submit()
+
+		so = make_inter_company_sales_order(po.name)
+		so.items[0].delivery_date = today()
+		so.submit()
+
+		self.assertRaisesRegex(
+			frappe.ValidationError, "was created from", make_inter_company_purchase_order, so.name
+		)
 
 	def test_repeat_internal_order_converts_ordered_qty_to_source_uom(self):
 		from erpnext.selling.doctype.sales_order.mapper import make_inter_company_purchase_order
@@ -3004,6 +3131,23 @@ def make_po_for_sales_order_row(sales_order_row):
 
 	selected_items = [{"name": sales_order_row.name, "supplier": "_Test Supplier"}]
 	return make_po_from_so(sales_order_row.parent, selected_items=selected_items)[0]
+
+
+def receive_material_request_in_parts():
+	"""Material Request for 3 fractional Boxes, ordered at once and received one Box at a time."""
+	item = make_item_with_fractional_box()
+	mr = make_material_request(item_code=item, qty=3, uom="Box", conversion_factor=0.666666667)
+	po = make_purchase_order(mr.name)
+	po.supplier = "_Test Supplier"
+	po.submit()
+
+	for _ in range(3):
+		pr = make_purchase_receipt(po.name)
+		pr.items[0].qty = pr.items[0].received_qty = 1
+		pr.submit()
+
+	mr.reload()
+	return mr
 
 
 def make_item_with_fractional_box(uom="Box"):

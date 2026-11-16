@@ -526,6 +526,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 			self.validate_work_order_status()
 
 		self.cancel_stock_reservation_entries_for_inward()
+		self.cancel_stock_reservation_entries_for_subcontracting()
 		self.update_stock_ledger()
 
 		self.ignore_linked_doctypes = (
@@ -1456,16 +1457,18 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 		if self.is_stock_reserve_for_work_order():
 			pro_doc = frappe.get_doc("Work Order", self.work_order)
-			if (
-				self.purpose == "Manufacture"
-				and not pro_doc.sales_order
-				and not self.job_card
-				and not pro_doc.production_plan_sub_assembly_item
-				and not pro_doc.subcontracting_inward_order
-			):
+			if self.skips_finished_good_reservation(pro_doc):
 				return
 
 			WorkOrderStockReservation(pro_doc).set_reserved_qty_for_wip_and_fg(self)
+
+	def skips_finished_good_reservation(self, pro_doc) -> bool:
+		return self.purpose == "Manufacture" and not (
+			pro_doc.sales_order
+			or self.job_card
+			or pro_doc.production_plan_sub_assembly_item
+			or pro_doc.subcontracting_inward_order
+		)
 
 	def reserve_stock_for_subcontracting(self):
 		if self.purpose == "Send to Subcontractor" and frappe.get_value(
@@ -1491,6 +1494,16 @@ class StockEntry(StockController, SubcontractingInwardController):
 				items=items.values(), stock_entry=self.name
 			)
 
+	def cancel_stock_reservation_entries_for_subcontracting(self):
+		from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+			cancel_stock_reservation_entries,
+		)
+
+		if self.purpose == "Send to Subcontractor":
+			cancel_stock_reservation_entries(
+				from_voucher_type="Stock Entry", from_voucher_no=self.name, notify=False
+			)
+
 	def cancel_stock_reserve_for_wip_and_fg(self):
 		from erpnext.manufacturing.doctype.work_order.services.reservation import (
 			WorkOrderStockReservation,
@@ -1498,11 +1511,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 		if self.is_stock_reserve_for_work_order():
 			pro_doc = frappe.get_doc("Work Order", self.work_order)
-			if (
-				self.purpose == "Manufacture"
-				and not pro_doc.sales_order
-				and not pro_doc.production_plan_sub_assembly_item
-			):
+			if self.skips_finished_good_reservation(pro_doc):
 				return
 
 			WorkOrderStockReservation(pro_doc).cancel_reserved_qty_for_wip_and_fg(self)
@@ -2361,11 +2370,11 @@ def get_warehouse_details(args: str | dict):
 
 	args = frappe._dict(args)
 
+	frappe.has_permission("Item", ptype="select", throw=True)
 	frappe.has_permission("Stock Entry", "read", throw=True)
 	check_warehouse_company(args.get("warehouse"))
 	check_company(args.get("company"))
 	if args.warehouse:
-		erpnext.require_user_permission("Warehouse", args.warehouse)
 		check_stock_entry_warehouse_permission(args.warehouse)
 
 	ret = {}
@@ -2384,7 +2393,9 @@ def get_warehouse_details(args: str | dict):
 
 
 def check_stock_entry_warehouse_permission(warehouse: str) -> None:
-	permissions = get_user_permissions().get("Warehouse", [])
-	allowed_warehouses = get_allowed_docs_for_doctype(permissions, "Stock Entry")
-	if allowed_warehouses and warehouse not in allowed_warehouses:
-		frappe.throw(_("Not permitted for {0}").format(warehouse), frappe.PermissionError)
+	user_permissions = get_user_permissions()
+	company = frappe.get_cached_value("Warehouse", warehouse, "company")
+	for doctype, name in (("Warehouse", warehouse), ("Company", company)):
+		allowed_docs = get_allowed_docs_for_doctype(user_permissions.get(doctype, []), "Stock Entry")
+		if allowed_docs and name not in allowed_docs:
+			frappe.throw(_("Not permitted for {0}").format(name), frappe.PermissionError)

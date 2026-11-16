@@ -619,6 +619,7 @@ class SerialandBatchBundle(Document):
 		bundle_data = frappe.get_all(
 			"Serial and Batch Bundle",
 			fields=[
+				"name",
 				"`tabSerial and Batch Entry`.`serial_no`",
 				"`tabSerial and Batch Entry`.`batch_no`",
 				"`tabSerial and Batch Entry`.`incoming_rate`",
@@ -626,6 +627,9 @@ class SerialandBatchBundle(Document):
 			filters=filters,
 			order_by="`tabSerial and Batch Bundle`.`creation`, `tabSerial and Batch Entry`.`idx`",
 		)
+		if delivered_bundle := self.get_delivered_packed_item_bundle():
+			# the delivered packed row's own rate wins for a batch other packed rows delivered too
+			bundle_data.sort(key=lambda row: row.name == delivered_bundle)
 
 		if not bundle_data:
 			bundle_data = self.get_legacy_valuation_rate_for_return_entry(
@@ -684,6 +688,31 @@ class SerialandBatchBundle(Document):
 				valuation_details["batches"][row.batch_no] = row.incoming_rate
 
 		return valuation_details
+
+	def get_delivered_packed_item_bundle(self):
+		"""Bundle of the delivered packed row that the return's packed row of this bundle reverses."""
+		if self.voucher_type not in ("Delivery Note", "Sales Invoice"):
+			return
+
+		returned = frappe.qb.DocType("Packed Item")
+		delivered = frappe.qb.DocType("Packed Item").as_("delivered")
+		bundles = (
+			frappe.qb.from_(returned)
+			.join(delivered)
+			.on(delivered.name == returned.return_against_packed_item)
+			.select(delivered.serial_and_batch_bundle)
+			# a packed row's bundle points to the packed row, or to its bundle row once posted
+			.where(
+				(returned.name == self.voucher_detail_no)
+				| (
+					(returned.parent_detail_docname == self.voucher_detail_no)
+					& (returned.serial_and_batch_bundle == self.name)
+				)
+			)
+			.limit(1)
+			.run()
+		)
+		return bundles[0][0] if bundles else None
 
 	def get_return_against_packed_item(self, field):
 		"""Resolve the original DN/SI Item when a return bundle's voucher_detail_no is the Packed Item."""
@@ -1024,6 +1053,8 @@ class SerialandBatchBundle(Document):
 				)
 
 	def set_serial_and_batch_values(self, parent, row, qty_field=None):
+		self.validate_not_linked_to_another_draft(parent, row)
+
 		values_to_set = {"is_cancelled": 0}
 		if not self.voucher_no or self.voucher_no != row.parent:
 			values_to_set["voucher_no"] = row.parent
@@ -1072,6 +1103,28 @@ class SerialandBatchBundle(Document):
 
 		self.calculate_qty_and_amount(save=True)
 		self.validate_quantity(row, qty_field=qty_field)
+
+	def validate_not_linked_to_another_draft(self, parent, row):
+		"""A draft voucher can't take over the bundle of another draft voucher."""
+		if not (self.voucher_type and self.voucher_no):
+			return
+
+		if self.voucher_type == parent.doctype and self.voucher_no == row.parent:
+			return
+
+		if frappe.db.get_value(self.voucher_type, self.voucher_no, "docstatus") != 0:
+			return
+
+		frappe.throw(
+			_(
+				"Row #{0}: Serial and Batch Bundle {1} belongs to {2} {3}. Select or create another bundle."
+			).format(
+				row.idx,
+				bold(self.name),
+				self.voucher_type,
+				get_link_to_form(self.voucher_type, self.voucher_no),
+			)
+		)
 
 	def validate_voucher_no(self):
 		if not (self.voucher_type and self.voucher_no):
@@ -2798,10 +2851,41 @@ def get_serial_and_batch_ledger(**kwargs):
 @frappe.whitelist()
 def get_auto_data(**kwargs):
 	kwargs = frappe._dict(kwargs)
+	if kwargs.warehouse:
+		require_permission("Warehouse", kwargs.warehouse, "select")
+
+	warehouses = frappe.get_list("Warehouse", pluck="name", limit=0)
+	if len(warehouses) == frappe.db.count("Warehouse"):
+		return get_auto_data_rows(kwargs)
+
+	return get_auto_data_rows_in_warehouses(kwargs, set(warehouses))
+
+
+def get_auto_data_rows(kwargs):
 	if cint(kwargs.has_serial_no):
 		return get_serial_nos_from_sre(kwargs) if kwargs.scio_detail else get_available_serial_nos(kwargs)
 	elif cint(kwargs.has_batch_no):
 		return get_batch_nos_from_sre(kwargs) if kwargs.scio_detail else get_auto_batch_nos(kwargs)
+
+
+def get_auto_data_rows_in_warehouses(kwargs, warehouses):
+	if not warehouses:
+		return []
+
+	if cint(kwargs.has_serial_no) and not kwargs.scio_detail:
+		kwargs.warehouse = kwargs.warehouse or list(warehouses)
+		return [row for row in get_available_serial_nos(kwargs) if row.warehouse in warehouses]
+
+	qty = flt(kwargs.qty)
+	kwargs.qty = 0
+	rows = [row for row in get_auto_data_rows(kwargs) or [] if row.warehouse in warehouses]
+	if not qty:
+		return rows
+
+	if cint(kwargs.has_serial_no):
+		return rows[: cint(qty)]
+
+	return get_qty_based_available_batches(rows, qty)
 
 
 def get_available_batches_qty(available_batches):
@@ -2832,7 +2916,9 @@ def get_available_serial_nos(kwargs):
 	# There might be chances that the serial no not exists in the warehouse during backdated stock transactions
 	if not kwargs.get("ignore_warehouse"):
 		filters["warehouse"] = ("is", "set")
-		if kwargs.warehouse:
+		if isinstance(kwargs.warehouse, list):
+			filters["warehouse"] = ("in", kwargs.warehouse)
+		elif kwargs.warehouse:
 			filters["warehouse"] = kwargs.warehouse
 
 	reserved_entries = [] if kwargs.get("ignore_reserved_stock") else get_reserved_serial_nos_for_sre(kwargs)
@@ -3254,7 +3340,9 @@ def get_reserved_serial_nos_for_sre(kwargs) -> list:
 		.orderby(sb_entry.idx)
 	)
 
-	if kwargs.warehouse:
+	if isinstance(kwargs.warehouse, list):
+		query = query.where(sre.warehouse.isin(kwargs.warehouse))
+	elif kwargs.warehouse:
 		query = query.where(sre.warehouse == kwargs.warehouse)
 
 	if kwargs.ignore_voucher_nos:
@@ -3648,7 +3736,7 @@ def get_qty_based_available_batches(available_batches, qty):
 	precision = frappe.get_precision("Stock Ledger Entry", "actual_qty")
 	batches = []
 	for batch in available_batches:
-		if qty <= 0:
+		if flt(qty, precision) <= 0:
 			break
 
 		batch_qty = flt(batch.qty)
@@ -3662,7 +3750,7 @@ def get_qty_based_available_batches(available_batches, qty):
 					}
 				)
 			)
-			qty = flt(qty - batch_qty, precision)
+			qty -= batch_qty
 		else:
 			batches.append(
 				frappe._dict(

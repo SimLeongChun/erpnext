@@ -150,14 +150,18 @@ class StockReservationEntry(Document):
 
 	def before_cancel(self) -> None:
 		self.validate_reserved_entries()
-		self.validate_work_order_usage()
+		self.validate_order_usage()
 
-	def validate_work_order_usage(self) -> None:
-		"""Stock a Work Order has transferred or consumed is released by closing the Work Order, not by cancelling its reservation."""
-		if self.voucher_type != "Work Order" or not (flt(self.transferred_qty) or flt(self.consumed_qty)):
+	def validate_order_usage(self) -> None:
+		"""Stock an order has transferred or consumed is released by closing the order, not by cancelling its reservation."""
+		if self.voucher_type not in ("Work Order", "Subcontracting Order") or not (
+			flt(self.transferred_qty) or flt(self.consumed_qty)
+		):
 			return
 
-		if frappe.db.get_value("Work Order", self.voucher_no, "status") in ("Closed", "Cancelled"):
+		status = frappe.db.get_value(self.voucher_type, self.voucher_no, "status")
+		# a closed Subcontracting Order keeps its used reservations and can be re-opened
+		if status == "Cancelled" or (status == "Closed" and self.voucher_type == "Work Order"):
 			return
 
 		if (
@@ -168,8 +172,8 @@ class StockReservationEntry(Document):
 
 		frappe.throw(
 			_(
-				"Stock Reservation Entry {0} is already used by Work Order {1}. Close the Work Order to release the unused stock."
-			).format(frappe.bold(self.name), frappe.bold(self.voucher_no))
+				"Stock Reservation Entry {0} is already used by {1} {2}. Close the {1} to release the unused stock."
+			).format(frappe.bold(self.name), _(self.voucher_type), frappe.bold(self.voucher_no))
 		)
 
 	def validate_reserved_entries(self):
@@ -1439,8 +1443,6 @@ class StockReservation:
 			sre.from_voucher_detail_no = item.get("from_voucher_detail_no")
 			sre.from_voucher_type = item.get("from_voucher_type")
 			sre.reservation_based_on = sre.reservation_based_on or "Qty"
-			if item_details.has_batch_no or item_details.has_serial_no:
-				sre.reservation_based_on = "Serial and Batch"
 
 			sre.save()
 
@@ -1563,7 +1565,7 @@ class StockReservation:
 				if available_qty <= 0:
 					continue
 
-				key = (row.item_code, row.warehouse, entry.voucher_detail_no)
+				key = (row.item_code, row.warehouse, entry.voucher_detail_no, row.reservation_based_on)
 
 				if key not in entries_to_reserve:
 					entries_to_reserve.setdefault(
@@ -1597,10 +1599,10 @@ class StockReservation:
 				entry.qty -= qty_to_reserve
 
 				entries_to_reserve[key]["qty_to_reserve"] += qty_to_reserve
-				if row.has_batch_no:
+				if row.batch_no:
 					entries_to_reserve[key]["batches"][row.batch_no] += qty_to_reserve
 
-				if row.has_serial_no:
+				if row.serial_no:
 					entries_to_reserve[key]["serial_nos"].append(row.serial_no)
 
 				if row.name:
@@ -1809,6 +1811,7 @@ class StockReservation:
 		elif to_doctype == "Subcontracting Order":
 			query = query.select(
 				child_doctype.stock_reserved_qty,
+				child_doctype.required_qty,
 				child_doctype.required_qty.as_("qty"),
 				child_doctype.reserve_warehouse.as_("source_warehouse"),
 			)
@@ -2249,7 +2252,8 @@ def get_status(sre) -> str:
 		return "Partially Delivered"
 	if sre.consumed_qty:
 		return "Partially Used"
-	if sre.reserved_qty >= sre.voucher_qty:
+	precision = frappe.get_precision("Stock Reservation Entry", "reserved_qty")
+	if flt(sre.reserved_qty, precision) >= flt(sre.voucher_qty, precision):
 		return "Reserved"
 	return "Partially Reserved"
 

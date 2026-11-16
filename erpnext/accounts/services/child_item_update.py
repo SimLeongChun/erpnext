@@ -636,7 +636,7 @@ def get_rows_with_kept_reservation(parent) -> set[str]:
 def validate_child_on_delete(row, parent, ordered_item=None) -> None:
 	"""Raise if a partially transacted child item is being deleted."""
 	if parent.doctype == "Sales Order":
-		if flt(row.delivered_qty):
+		if flt(row.delivered_qty) or flt(row.returned_qty):
 			frappe.throw(
 				_("Row #{0}: Cannot delete item {1} which has already been delivered").format(
 					row.idx, row.item_code
@@ -655,7 +655,7 @@ def validate_child_on_delete(row, parent, ordered_item=None) -> None:
 				).format(row.idx, row.item_code)
 			)
 
-	if parent.doctype == "Purchase Order" and flt(row.received_qty):
+	if parent.doctype == "Purchase Order" and (flt(row.received_qty) or flt(row.returned_qty)):
 		frappe.throw(
 			_("Row #{0}: Cannot delete item {1} which has already been received").format(
 				row.idx, row.item_code
@@ -716,6 +716,69 @@ def validate_no_issued_proforma(rows) -> None:
 			)
 
 
+def validate_no_linked_order(rows, parent, linked_doctype) -> None:
+	"""Raise if a row being deleted is linked by a draft or submitted `linked_doctype` row."""
+	if not rows:
+		return
+
+	link_field = frappe.scrub(parent.doctype)
+	linked_orders = dict(
+		frappe.get_all(
+			f"{linked_doctype} Item",
+			filters={
+				link_field: parent.name,
+				f"{link_field}_item": ["in", [row.name for row in rows]],
+				"docstatus": ["<", 2],
+			},
+			fields=[f"{link_field}_item", "parent"],
+			as_list=True,
+		)
+	)
+	for row in rows:
+		if linked_order := linked_orders.get(row.name):
+			frappe.throw(
+				_("Row #{0}: Cannot delete item {1} which is already ordered on {2} {3}.").format(
+					row.idx, row.item_code, _(linked_doctype), get_link_to_form(linked_doctype, linked_order)
+				)
+			)
+
+
+def validate_no_ordered_packed_item(rows, parent) -> None:
+	"""Raise if a Sales Order bundle row being deleted has a packed item on a draft or submitted Purchase Order."""
+	deleted_rows = {row.name for row in rows}
+	row_by_packed_item = {
+		packed.name: packed.parent_detail_docname
+		for packed in parent.get("packed_items")
+		if packed.parent_detail_docname in deleted_rows
+	}
+	if not row_by_packed_item:
+		return
+
+	purchase_orders = dict(
+		frappe.get_all(
+			"Purchase Order Item",
+			filters={
+				"sales_order": parent.name,
+				"sales_order_packed_item": ["in", list(row_by_packed_item)],
+				"docstatus": ["<", 2],
+			},
+			fields=["sales_order_packed_item", "parent"],
+			as_list=True,
+		)
+	)
+	ordered_rows = {row_by_packed_item[packed]: order for packed, order in purchase_orders.items()}
+	for row in rows:
+		if purchase_order := ordered_rows.get(row.name):
+			frappe.throw(
+				_("Row #{0}: Cannot delete item {1} which is already ordered on {2} {3}.").format(
+					row.idx,
+					row.item_code,
+					_("Purchase Order"),
+					get_link_to_form("Purchase Order", purchase_order),
+				)
+			)
+
+
 def validate_no_kept_reservation(rows, parent) -> None:
 	"""Raise if a Sales Order row being deleted still holds reserved stock."""
 	if not rows:
@@ -744,6 +807,10 @@ def validate_and_delete_children(parent, data, ordered_item=None) -> bool:
 	if parent.doctype == "Sales Order":
 		validate_no_issued_proforma(deleted_children)
 		validate_no_kept_reservation(deleted_children, parent)
+		validate_no_linked_order(deleted_children, parent, "Purchase Order")
+		validate_no_ordered_packed_item(deleted_children, parent)
+	elif parent.doctype == "Purchase Order":
+		validate_no_linked_order(deleted_children, parent, "Sales Order")
 
 	for d in deleted_children:
 		validate_child_on_delete(d, parent, ordered_item)

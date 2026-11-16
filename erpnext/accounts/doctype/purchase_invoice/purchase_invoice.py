@@ -39,7 +39,7 @@ from erpnext.accounts.utils import (
 	update_voucher_outstanding,
 )
 from erpnext.assets.doctype.asset.asset import is_cwip_accounting_enabled
-from erpnext.controllers.buying_controller import BuyingController, get_stock_qty_status_args
+from erpnext.controllers.buying_controller import BuyingController, get_received_stock_qty_status_args
 from erpnext.manufacturing.doctype.production_plan.services.reservation import reserve_received_stock
 from erpnext.projects.doctype.project.project import update_purchase_cost
 from erpnext.stock.doctype.purchase_receipt.services.billing_status import (
@@ -53,6 +53,7 @@ from erpnext.stock.doctype.purchase_receipt.services.billing_status import (
 from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
 	cancel_stock_reservation_entries,
 )
+from erpnext.stock.services.internal_transfer import StockInternalTransferService
 
 
 class WarehouseMissingError(frappe.ValidationError):
@@ -710,9 +711,9 @@ class PurchaseInvoice(BuyingController):
 					"target_parent_dt": "Material Request",
 					"target_parent_field": "per_received",
 					"target_ref_field": "stock_qty",
-					**get_stock_qty_status_args(),
+					**get_received_stock_qty_status_args(),
 					"second_source_dt": "Purchase Receipt Item",
-					"second_source_field": get_stock_qty_status_args()["source_field"],
+					"second_source_field": "qty * conversion_factor",
 					"second_join_field": "material_request_item",
 					"extra_cond": """ and exists(select name from `tabPurchase Invoice`
 					where name=`tabPurchase Invoice Item`.parent and update_stock = 1)""",
@@ -894,6 +895,9 @@ class PurchaseInvoice(BuyingController):
 
 	def on_cancel(self):
 		check_if_return_invoice_linked_with_payment_entry(self)
+		if self.is_return and self.is_internal_supplier:
+			# cancelling a return gives its qty back to the invoice it returned
+			StockInternalTransferService(self).validate_internal_transfer_qty()
 
 		super().on_cancel()
 		PurchaseTaxWithholding(self).on_cancel()
