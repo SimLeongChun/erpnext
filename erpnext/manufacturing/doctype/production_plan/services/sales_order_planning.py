@@ -9,7 +9,10 @@ from frappe.query_builder.functions import IfNull, Sum
 from frappe.utils import flt, now_datetime
 from pypika.terms import ExistsCriterion
 
-from erpnext.manufacturing.doctype.production_plan.services.planning_queries import get_sales_orders
+from erpnext.manufacturing.doctype.production_plan.services.planning_queries import (
+	get_item_or_template_bom_query,
+	get_sales_orders,
+)
 from erpnext.manufacturing.doctype.work_order.work_order import get_item_details
 
 
@@ -67,7 +70,7 @@ class SalesOrderSourcingService:
 				& (mr.docstatus == 1)
 				& (mr.status != "Stopped")
 				& (mr.company == self.doc.company)
-				& (mr_item.qty > IfNull(mr_item.ordered_qty, 0))
+				& (mr_item.stock_qty > IfNull(mr_item.ordered_qty, 0))
 				& (mr_item.stock_qty > IfNull(_mr_item_planned_qty_query(mr_item), 0))
 				& bom_exists
 			)
@@ -157,7 +160,7 @@ class SalesOrderSourcingService:
 	def _so_items(self, so_list):
 		bom = frappe.qb.DocType("BOM")
 		so_item = frappe.qb.DocType("Sales Order Item")
-		items_subquery = frappe.qb.from_(bom).select(bom.name).where(bom.is_active == 1)
+		items_subquery = get_item_or_template_bom_query(bom, so_item)
 		items_query = (
 			frappe.qb.from_(so_item)
 			.select(*_so_item_columns(so_item))
@@ -376,7 +379,8 @@ def _mr_item_columns(mr_item):
 		mr_item.warehouse,
 		mr_item.description,
 		mr_item.bom_no,
-		((mr_item.qty - mr_item.ordered_qty) * mr_item.conversion_factor).as_("pending_qty"),
+		# ordered_qty of a Manufacture request is the Work Order qty in stock UOM
+		(mr_item.stock_qty - mr_item.ordered_qty).as_("pending_qty"),
 		mr_item.stock_qty,
 		IfNull(_mr_item_planned_qty_query(mr_item), 0).as_("planned_qty"),
 	]
@@ -398,6 +402,6 @@ def _mr_items_filter(bom, mr_item, mr_list):
 	return (
 		(mr_item.parent.isin(mr_list))
 		& (mr_item.docstatus == 1)
-		& (mr_item.qty > mr_item.ordered_qty)
+		& (mr_item.stock_qty > mr_item.ordered_qty)
 		& bom_exists
 	)

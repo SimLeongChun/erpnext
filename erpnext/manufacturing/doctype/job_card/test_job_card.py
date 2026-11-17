@@ -10,6 +10,7 @@ from frappe.utils import flt, random_string
 from frappe.utils.data import add_to_date, now, today
 
 from erpnext.manufacturing.doctype.job_card.job_card import (
+	JobCardCancelError,
 	JobCardOverTransferError,
 	OperationSequenceError,
 	OverlapError,
@@ -4190,20 +4191,75 @@ class TestJobCard(ERPNextTestSuite):
 			job_card_b.submit()
 
 			operation_a = work_order.operations[0]
-			make_job_card(
+			self.assertRaisesRegex(
+				frappe.ValidationError,
+				"cannot be greater than Qty To Manufacture",
+				make_job_card,
 				work_order.name,
 				[{"name": operation_a.name, "operation": operation_a.operation, "qty": 1, "pending_qty": 1}],
-			)
-			extra_job_card_a = frappe.get_last_doc(
-				"Job Card", {"operation_id": operation_a.name, "docstatus": 0}
-			)
-			complete(extra_job_card_a, 1, 5)
-			self.assertRaisesRegex(
-				frappe.ValidationError, "Completed Qty cannot be greater", extra_job_card_a.submit
 			)
 
 		work_order.reload()
 		self.assertEqual([row.status for row in work_order.operations], ["Completed", "Completed"])
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_card_for_handed_over_pending_qty_cannot_be_cancelled_after_manufacture(self):
+		workstation = make_jc_review_workstation()
+		operation = make_jc_review_operation(workstation)
+		rm_item = make_jc_review_item()
+		make_stock_entry(item_code=rm_item, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": rm_item, "qty": 1}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 6}],
+			skip_transfer=1,
+		)
+
+		first_card = get_jc_review_job_cards(wo.name)[0]
+		first_card.append("time_logs", jc_review_log("2031-03-03 08:00:00", 36, 6))
+		first_card.pending_qty = 4
+		first_card.submit()
+
+		row = frappe.get_doc("Work Order", wo.name).operations[0]
+		make_job_card(wo.name, [{"name": row.name, "operation": row.operation, "qty": 4, "pending_qty": 4}])
+		second_card = frappe.get_last_doc("Job Card", {"work_order": wo.name, "docstatus": 0})
+		second_card.append("time_logs", jc_review_log("2031-03-03 09:00:00", 24, 4))
+		second_card.submit()
+
+		frappe.get_doc(make_stock_entry_for_work_order(wo.name, "Manufacture", 10)).submit()
+
+		self.assertRaises(JobCardCancelError, second_card.cancel)
+
+	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
+	def test_extra_job_card_is_refused_after_the_operation_is_complete(self):
+		workstation = make_jc_review_workstation()
+		operation = make_jc_review_operation(workstation)
+		wo = make_jc_review_work_order(
+			make_jc_review_item(),
+			[{"item_code": make_jc_review_item(), "qty": 1}],
+			[{"operation": operation, "workstation": workstation, "time_in_mins": 6}],
+			skip_transfer=1,
+		)
+		job_card = get_jc_review_job_cards(wo.name)[0]
+		job_card.append("time_logs", jc_review_log("2031-03-03 08:00:00", 60, 10))
+		job_card.submit()
+
+		extra_job_card = frappe.get_doc(
+			{
+				"doctype": "Job Card",
+				"work_order": wo.name,
+				"operation": operation,
+				"operation_id": job_card.operation_id,
+				"workstation": workstation,
+				"for_quantity": 10,
+				"company": wo.company,
+				"wip_warehouse": wo.wip_warehouse,
+				"posting_date": today(),
+			}
+		)
+		self.assertRaisesRegex(
+			frappe.ValidationError, "cannot be greater than Qty To Manufacture", extra_job_card.insert
+		)
 
 	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
 	def test_sub_operations_with_two_operators_keep_completed_qty(self):
@@ -4232,6 +4288,39 @@ class TestJobCard(ERPNextTestSuite):
 
 		self.assertEqual([row.completed_qty for row in job_card.sub_operations], [10, 10])
 		self.assertEqual((job_card.total_completed_qty, job_card.process_loss_qty), (10, 0))
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"disable_capacity_planning": 0, "mins_between_operations": 10}
+	)
+	def test_workstation_type_card_is_scheduled_on_the_free_workstation(self):
+		workstation_type, (busy, free) = make_jc_review_type_workstations(2)
+		make_jc_review_scheduled_job_card("2031-03-03 08:00:00", 12, workstation=busy)
+
+		job_card = make_jc_review_scheduled_job_card(
+			"2031-03-03 09:00:00", 6, workstation_type=workstation_type
+		)
+		self.assertEqual(job_card.workstation, free)
+		self.assertEqual(
+			[(str(row.from_time), str(row.to_time)) for row in job_card.scheduled_time_logs],
+			[("2031-03-03 09:00:00", "2031-03-03 10:00:00")],
+		)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"disable_capacity_planning": 0, "mins_between_operations": 10}
+	)
+	def test_workstation_type_card_uses_spare_workstation_capacity(self):
+		workstation_type, (workstation,) = make_jc_review_type_workstations(1)
+		frappe.db.set_value("Workstation", workstation, "production_capacity", 2)
+		make_jc_review_scheduled_job_card("2031-03-03 08:00:00", 12, workstation=workstation)
+
+		job_card = make_jc_review_scheduled_job_card(
+			"2031-03-03 09:00:00", 6, workstation_type=workstation_type
+		)
+		self.assertEqual(job_card.workstation, workstation)
+		self.assertEqual(
+			[(str(row.from_time), str(row.to_time)) for row in job_card.scheduled_time_logs],
+			[("2031-03-03 09:00:00", "2031-03-03 10:00:00")],
+		)
 
 	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"disable_capacity_planning": 1})
 	def test_partial_sub_operation_cycles_keep_job_card_qty(self):
@@ -5697,6 +5786,40 @@ def make_jc_review_work_order(fg_item, rows, operations, qty=10, bom_quantity=1,
 	wo.insert()
 	wo.submit()
 	return wo
+
+
+def make_jc_review_type_workstations(count):
+	from erpnext.manufacturing.doctype.workstation_type.test_workstation_type import (
+		create_workstation_type,
+	)
+
+	workstation_type = create_workstation_type(
+		workstation_type=f"_Test JC Review Type {random_string(6)}"
+	).name
+	workstations = [
+		make_workstation(
+			workstation_name=f"_Test JC Review Workstation {random_string(6)}",
+			workstation_type=workstation_type,
+		).name
+		for _ in range(count)
+	]
+	return workstation_type, workstations
+
+
+def make_jc_review_scheduled_job_card(planned_start, time_in_mins, workstation=None, workstation_type=None):
+	operation = {
+		"operation": make_jc_review_operation(workstation),
+		"workstation": workstation,
+		"workstation_type": workstation_type,
+		"time_in_mins": time_in_mins,
+	}
+	wo = make_jc_review_work_order(
+		make_jc_review_item(),
+		[{"item_code": make_jc_review_item(), "qty": 1}],
+		[operation],
+		planned_start_date=planned_start,
+	)
+	return get_jc_review_job_cards(wo.name)[0]
 
 
 def make_jc_review_employee():
