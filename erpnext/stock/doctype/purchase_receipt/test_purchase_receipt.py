@@ -42,6 +42,26 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		frappe.local.future_sle = {}
 		self.load_test_records("Purchase Receipt")
 
+	def test_bin_lock_includes_parent_warehouses(self):
+		receipt = frappe.get_doc(
+			{
+				"doctype": "Purchase Receipt",
+				"set_warehouse": "_Test Warehouse - _TC",
+				"supplier_warehouse": "_Test Warehouse 1 - _TC",
+				"items": [{"item_code": "_Test Item"}],
+				"supplied_items": [{"rm_item_code": "_Test Item Home Desktop 100"}],
+			}
+		)
+
+		self.assertEqual(
+			receipt.get_item_warehouses(),
+			{
+				(item_code, warehouse)
+				for item_code in ("_Test Item", "_Test Item Home Desktop 100")
+				for warehouse in ("_Test Warehouse - _TC", "_Test Warehouse 1 - _TC")
+			},
+		)
+
 	def test_purchase_receipt_skips_validation(self):
 		"""
 		Test that validation is skipped when over delivery receipt allowance is reduced after PO submission
@@ -7818,6 +7838,42 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 			"Serial and Batch Bundle", pr.items[0].rejected_serial_and_batch_bundle, "total_qty"
 		)
 		self.assertEqual(abs(total_qty), 1)
+
+	def test_internal_pr_rejected_qty_cleared_removes_rejected_package(self):
+		"""Setting the rejected qty of a draft internal receipt to 0 removes its rejected package."""
+		item = make_item(
+			"_Test Batch Item For Rejected Qty Cleared",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIRQX-.####"},
+		)
+
+		pr, *_ = self.make_transfer_receipt(item, 1, 2)
+		pr.save()
+		package = pr.items[0].rejected_serial_and_batch_bundle
+		self.assertTrue(package)
+
+		pr.items[0].update({"rejected_qty": 0, "received_qty": 1})
+		pr.save()
+
+		self.assertFalse(pr.items[0].rejected_serial_and_batch_bundle)
+		self.assertFalse(frappe.db.exists("Serial and Batch Bundle", package))
+
+	def test_internal_pr_accepted_qty_cleared_removes_accepted_package(self):
+		"""Rejecting all of a draft internal receipt removes its accepted package."""
+		item = make_item(
+			"_Test Batch Item For Accepted Qty Cleared",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIAQX-.####"},
+		)
+
+		pr, *_ = self.make_transfer_receipt(item, 1, 2)
+		pr.save()
+		package = pr.items[0].serial_and_batch_bundle
+		self.assertTrue(package)
+
+		pr.items[0].update({"qty": 0, "rejected_qty": 3})
+		pr.save()
+
+		self.assertFalse(pr.items[0].serial_and_batch_bundle)
+		self.assertFalse(frappe.db.exists("Serial and Batch Bundle", package))
 
 	def test_valuation_rate_for_rejected_materials(self):
 		item = make_item("Test Item with Rej Material Valuation", {"is_stock_item": 1})
