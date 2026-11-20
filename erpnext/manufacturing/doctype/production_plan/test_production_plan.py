@@ -607,6 +607,34 @@ class TestProductionPlan(ERPNextTestSuite):
 		pln.reload()
 		pln.cancel()
 
+	def test_combined_plan_skips_references_of_items_without_default_bom(self):
+		item = "Test Production Item 1"
+		item_with_draft_bom = make_item("_Test PP Combine Item With Draft BOM", {"is_stock_item": 1}).name
+		make_bom(item=item_with_draft_bom, raw_materials=["Raw Material Item 1"], do_not_submit=True)
+		sales_order = make_sales_order(item_code=item, qty=5, do_not_submit=1)
+		sales_order.append(
+			"items",
+			{
+				"item_code": item_with_draft_bom,
+				"qty": 2,
+				"rate": 100,
+				"warehouse": sales_order.items[0].warehouse,
+			},
+		)
+		sales_order.submit()
+
+		pln = frappe.new_doc("Production Plan")
+		pln.company = sales_order.company
+		pln.get_items_from = "Sales Order"
+		pln.combine_items = 1
+		pln.append("sales_orders", {"sales_order": sales_order.name})
+		pln.get_items()
+
+		self.assertEqual(
+			[(row.sales_order_item, row.qty) for row in pln.prod_plan_references],
+			[(sales_order.items[0].name, 5)],
+		)
+
 	def test_production_plan_subassembly_default_supplier(self):
 		from erpnext.manufacturing.doctype.bom.test_bom import create_nested_bom
 
@@ -4973,29 +5001,7 @@ class TestProductionPlan(ERPNextTestSuite):
 		"Stock Settings", {"enable_stock_reservation": 1, "allow_negative_stock": 0}
 	)
 	def test_closing_a_plan_releases_its_untouched_reservations(self):
-		from erpnext.manufacturing.doctype.production_plan.production_plan import (
-			get_items_for_material_requests,
-		)
-
-		warehouse = "_Test Warehouse - _TC"
-		raw_material = make_item(properties={"is_stock_item": 1}).name
-		finished_good = make_item(properties={"is_stock_item": 1}).name
-		make_bom(item=finished_good, raw_materials=[raw_material], rm_qty=1)
-		make_stock_entry(item_code=raw_material, target=warehouse, qty=5, basic_rate=100)
-
-		plan = create_production_plan(
-			item_code=finished_good,
-			planned_qty=5,
-			ignore_existing_ordered_qty=1,
-			do_not_submit=1,
-			warehouse=warehouse,
-			for_warehouse=warehouse,
-			reserve_stock=1,
-		)
-		plan.set("mr_items", [])
-		for row in get_items_for_material_requests(plan.as_dict()):
-			plan.append("mr_items", row)
-		plan.submit()
+		plan = self.make_plan_with_reserved_raw_material()
 		self.assertTrue(
 			frappe.db.exists("Stock Reservation Entry", {"voucher_no": plan.name, "docstatus": 1})
 		)
@@ -5019,6 +5025,51 @@ class TestProductionPlan(ERPNextTestSuite):
 		self.assertFalse(
 			frappe.db.exists("Stock Reservation Entry", {"voucher_no": plan.name, "docstatus": 1})
 		)
+
+	@ERPNextTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_reserve_and_unreserve_stock_accept_dict_doc(self):
+		from erpnext.manufacturing.doctype.production_plan.production_plan import (
+			cancel_stock_reservation_entries,
+			make_stock_reservation_entries,
+		)
+
+		plan = self.make_plan_with_reserved_raw_material()
+		filters = {"voucher_no": plan.name, "docstatus": 1}
+		sre_list = frappe.get_all("Stock Reservation Entry", filters=filters, pluck="name")
+		self.assertTrue(sre_list)
+
+		# The dialogs send the form's doc as a dict.
+		cancel_stock_reservation_entries(doc=plan.as_dict(), sre_list=sre_list)
+		self.assertFalse(frappe.db.exists("Stock Reservation Entry", filters))
+
+		make_stock_reservation_entries(doc=plan.as_dict(), table_name="mr_items")
+		self.assertTrue(frappe.db.exists("Stock Reservation Entry", filters))
+
+	def make_plan_with_reserved_raw_material(self):
+		from erpnext.manufacturing.doctype.production_plan.production_plan import (
+			get_items_for_material_requests,
+		)
+
+		warehouse = "_Test Warehouse - _TC"
+		raw_material = make_item(properties={"is_stock_item": 1}).name
+		finished_good = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=finished_good, raw_materials=[raw_material], rm_qty=1)
+		make_stock_entry(item_code=raw_material, target=warehouse, qty=5, basic_rate=100)
+
+		plan = create_production_plan(
+			item_code=finished_good,
+			planned_qty=5,
+			ignore_existing_ordered_qty=1,
+			do_not_submit=1,
+			warehouse=warehouse,
+			for_warehouse=warehouse,
+			reserve_stock=1,
+		)
+		plan.set("mr_items", [])
+		for row in get_items_for_material_requests(plan.as_dict()):
+			plan.append("mr_items", row)
+		plan.submit()
+		return plan
 
 	def test_only_submitted_plan_can_be_closed_or_reopened(self):
 		finished_good = make_item(properties={"is_stock_item": 1}).name

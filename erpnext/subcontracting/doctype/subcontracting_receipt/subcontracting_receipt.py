@@ -510,6 +510,7 @@ class SubcontractingReceipt(SubcontractingController):
 					"item_code",
 					"qty",
 					"received_qty",
+					"process_loss_qty",
 					"reference_name",
 					"bom_secondary_item",
 					"secondary_item_type",
@@ -602,7 +603,7 @@ class SubcontractingReceipt(SubcontractingController):
 
 		precision = row.precision("received_qty")
 		return flt(original_row.returned_qty - flt(row.received_qty), precision) >= flt(
-			original_row.received_qty, precision
+			original_row.received_qty - original_row.process_loss_qty, precision
 		)
 
 	def calculate_percentage_secondary_rows(self, percentage_rows, secondary_items_cost_map):
@@ -999,6 +1000,7 @@ class SubcontractingReceipt(SubcontractingController):
 		return ratios
 
 	def validate_secondary_items(self):
+		fg_rows = {item.name for item in self.items if not (item.secondary_item_type or item.valuation_type)}
 		for item in self.items:
 			if item.secondary_item_type or item.valuation_type:
 				if not item.qty:
@@ -1018,6 +1020,13 @@ class SubcontractingReceipt(SubcontractingController):
 						_("Row #{0}: Finished Good reference is mandatory for Secondary Item {1}.").format(
 							item.idx, frappe.bold(item.item_code)
 						),
+					)
+
+				if item.reference_name not in fg_rows:
+					frappe.throw(
+						_(
+							"Row #{0}: The Finished Good row of Secondary Item {1} is not on this receipt. Remove the Secondary Item row."
+						).format(item.idx, frappe.bold(item.item_code)),
 					)
 
 	def validate_accepted_warehouse(self):
@@ -1116,9 +1125,15 @@ class SubcontractingReceipt(SubcontractingController):
 						"target_field": "returned_qty",
 						"target_parent_dt": "Subcontracting Receipt",
 						"target_parent_field": "per_returned",
-						"target_ref_field": "received_qty",
+						# a return sends back no process loss
+						"target_ref_field": {
+							"SUB": ["received_qty", "process_loss_qty"],
+							"as": "returnable_qty",
+						},
 						"source_field": "-1 * received_qty",
 						"percent_join_field_parent": "return_against",
+						# validate_return checks over-returns
+						"validate_qty": False,
 					},
 				]
 			)

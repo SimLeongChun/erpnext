@@ -764,7 +764,10 @@ class SellingController(StockController):
 				and not item_details.has_batch_no
 			):
 				# Get incoming rate based on original item cost based on valuation method
-				qty = flt(d.get("stock_qty") or d.get("actual_qty") or d.get("qty"))
+				if d.doctype == "Packed Item":
+					qty = flt(d.qty)
+				else:
+					qty = flt(d.get("stock_qty") or d.get("actual_qty") or d.get("qty"))
 
 				if old_doc:
 					reset_incoming_rate()
@@ -821,14 +824,7 @@ class SellingController(StockController):
 				# For internal transfers use incoming rate as the valuation rate
 				if self.is_internal_transfer():
 					if self.doctype == "Delivery Note" or self.get("update_stock"):
-						if d.doctype == "Packed Item":
-							incoming_rate = flt(
-								flt(d.incoming_rate, d.precision("incoming_rate")) * d.conversion_factor,
-								d.precision("incoming_rate"),
-							)
-							if d.incoming_rate != incoming_rate:
-								d.incoming_rate = incoming_rate
-						else:
+						if d.doctype != "Packed Item":
 							if allow_at_arms_length_price:
 								continue
 
@@ -1282,6 +1278,29 @@ class SellingController(StockController):
 					sre_doc.update_reserved_qty_in_voucher(update_modified=False)
 
 					qty_to_undelivered -= qty_can_be_undelivered
+
+	def validate_against_pick_list_items(self):
+		"""Refuse a row whose item is not the item picked on its Pick List row."""
+		pick_list_items = {row.pick_list_item for row in self.items if row.pick_list_item}
+		if not pick_list_items:
+			return
+
+		picked_items = dict(
+			frappe.get_all(
+				"Pick List Item",
+				filters={"name": ("in", list(pick_list_items))},
+				fields=["name", "item_code"],
+				as_list=True,
+			)
+		)
+		for row in self.items:
+			picked_item = picked_items.get(row.pick_list_item)
+			if picked_item and row.item_code != picked_item:
+				frappe.throw(
+					_("Row #{0}: Item {1} is not the item {2} picked in {3}.").format(
+						row.idx, frappe.bold(row.item_code), frappe.bold(picked_item), row.against_pick_list
+					)
+				)
 
 	def set_serial_and_batch_bundle_from_pick_list(self):
 		from erpnext.stock.serial_batch_bundle import SerialBatchCreation

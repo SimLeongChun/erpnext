@@ -387,6 +387,7 @@ class SalesInvoice(SellingController):
 					row.billing_amount = -abs(row.billing_amount)
 
 		self.validate_update_stock_for_pick_list_reference()
+		self.validate_against_pick_list_items()
 		self.set_serial_and_batch_bundle_from_pick_list()
 		self.update_packing_list()
 		TimesheetBillingService(self).set_billing_hours_and_amount()
@@ -1371,6 +1372,8 @@ def make_regional_gl_entries(gl_entries, doc):
 
 @frappe.whitelist()
 def get_bank_cash_account(mode_of_payment: str, company: str) -> dict:
+	frappe.has_permission("Company", "select", company, throw=True)
+	frappe.has_permission("Mode of Payment", "select", mode_of_payment, throw=True)
 	return _get_bank_cash_account(mode_of_payment, company)
 
 
