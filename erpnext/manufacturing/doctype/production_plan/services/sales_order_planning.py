@@ -23,10 +23,8 @@ class SalesOrderSourcingService:
 	def get_open_sales_orders(self):
 		"""Pull sales orders  which are pending to deliver based on criteria selected"""
 		open_so = get_sales_orders(self.doc)
-
-		if open_so:
-			self.add_so_in_table(open_so)
-		else:
+		self.add_so_in_table(open_so)
+		if not open_so:
 			frappe.msgprint(_("Sales orders are not available for production"))
 
 	def add_so_in_table(self, open_so):
@@ -304,7 +302,8 @@ def _so_item_columns(so_item):
 		so_item.parent,
 		so_item.item_code,
 		so_item.warehouse,
-		(so_item.stock_qty - so_item.stock_reserved_qty).as_("qty"),
+		(so_item.stock_qty - _reserved_qty_from_stock(so_item)).as_("qty"),
+		_reserved_work_order_output_qty(so_item).as_("reserved_work_order_output_qty"),
 		so_item.work_order_qty,
 		so_item.stock_qty,
 		so_item.production_plan_qty,
@@ -320,17 +319,51 @@ def _so_items_filter(so_item, so_list):
 	return (
 		(so_item.parent.isin(so_list))
 		& (so_item.docstatus == 1)
-		& ((so_item.stock_qty - so_item.stock_reserved_qty) > so_item.work_order_qty)
+		& (so_item.closed == 0)
+		& ((so_item.stock_qty - _reserved_qty_from_stock(so_item)) > so_item.work_order_qty)
 		& (so_item.stock_qty > so_item.production_plan_qty)
 	)
 
 
-def _set_so_item_pending_qty(items):
-	for item in items:
-		pending_qty = flt(item.qty) - max(
-			item.work_order_qty, flt(item.delivered_qty) * item.conversion_factor, 0
+def _reserved_qty_from_stock(so_item):
+	"""Reserved qty of a Sales Order Item, less the Work Order output that work_order_qty already counts."""
+	return so_item.stock_reserved_qty - _reserved_work_order_output_qty(so_item)
+
+
+def _reserved_work_order_output_qty(so_item):
+	"""Open reservations of the output of a Sales Order Item's own Work Orders."""
+	sre = frappe.qb.DocType("Stock Reservation Entry")
+	stock_entry = frappe.qb.DocType("Stock Entry")
+	work_order = frappe.qb.DocType("Work Order")
+	work_order_output_qty = (
+		frappe.qb.from_(sre)
+		.inner_join(stock_entry)
+		.on(stock_entry.name == sre.from_voucher_no)
+		.inner_join(work_order)
+		.on(work_order.name == stock_entry.work_order)
+		.select(Sum(sre.reserved_qty - sre.delivered_qty - sre.transferred_qty - sre.consumed_qty))
+		.where(
+			(sre.docstatus == 1)
+			& (sre.voucher_type == "Sales Order")
+			& (sre.voucher_detail_no == so_item.name)
+			& (sre.from_voucher_type == "Stock Entry")
+			& (work_order.sales_order_item == so_item.name)
 		)
-		item.pending_qty = min(pending_qty, flt(item.stock_qty) - flt(item.production_plan_qty))
+	)
+	return IfNull(work_order_output_qty, 0)
+
+
+def _set_so_item_pending_qty(items):
+	precision = frappe.get_precision("Production Plan Item", "planned_qty")
+	for item in items:
+		# Reserved Work Order output is not delivered yet, so deliveries come on top of it
+		delivered_or_reserved_qty = flt(item.delivered_qty) * item.conversion_factor + flt(
+			item.reserved_work_order_output_qty
+		)
+		pending_qty = flt(item.qty) - max(item.work_order_qty, delivered_or_reserved_qty, 0)
+		item.pending_qty = flt(
+			min(pending_qty, flt(item.stock_qty) - flt(item.production_plan_qty)), precision
+		)
 
 
 def _so_packed_columns(so_item, pi):
@@ -363,7 +396,8 @@ def _so_packed_filter(bom, so_item, pi, so_list):
 	return (
 		(so_item.parent == pi.parent)
 		& (so_item.docstatus == 1)
-		& (pi.parent_item == so_item.item_code)
+		& (pi.parent_detail_docname == so_item.name)
+		& (so_item.closed == 0)
 		& (so_item.parent.isin(so_list))
 		& pending
 		& bom_exists

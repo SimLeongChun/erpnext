@@ -421,7 +421,6 @@ class MasterProductionSchedule(Document):
 				_("No open Material Requests found for the given criteria."),
 				alert=True,
 			)
-			return
 
 		for row in materials_requests:
 			self.append(
@@ -472,11 +471,7 @@ class MasterProductionSchedule(Document):
 			data = parse_json(data)
 
 		self.set("sales_orders", [])
-		sales_orders = self.get_sales_orders(data)
-		if not sales_orders:
-			return
-
-		for row in sales_orders:
+		for row in self.get_sales_orders(data):
 			self.append(
 				"sales_orders",
 				{
@@ -548,24 +543,6 @@ class MasterProductionSchedule(Document):
 
 	def after_delete(self):
 		update_sales_forecast_status(self.sales_forecast)
-
-	def on_submit(self):
-		self.enqueue_mrp_creation()
-
-	def enqueue_mrp_creation(self):
-		frappe.enqueue_doc(
-			"Master Production Schedule",
-			self.name,
-			"make_mrp",
-			queue="long",
-			timeout=1800,
-			enqueue_after_commit=True,
-		)
-
-		frappe.msgprint(
-			_("MRP Log documents are being created in the background."),
-			alert=True,
-		)
 
 
 def get_own_lead_time(lead_time, qty, is_manufactured):
