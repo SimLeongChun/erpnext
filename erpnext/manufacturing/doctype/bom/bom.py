@@ -680,6 +680,8 @@ class BOM(WebsiteGenerator):
 		)
 		args.update(item)
 
+		# the form may send a stale price list exchange rate
+		self.set_plc_conversion_rate()
 		rate = self.get_rm_rate(args) if args.get("fetch_rate") else 0
 		return self._build_rm_detail(args, item, rate)
 
@@ -893,10 +895,21 @@ class BOM(WebsiteGenerator):
 	def set_conversion_rate(self):
 		if self.currency == self.company_currency():
 			self.conversion_rate = 1
-		elif self.conversion_rate == 1 or flt(self.conversion_rate) <= 0:
+		elif self.conversion_rate == 1 or flt(self.conversion_rate) <= 0 or self.has_stale_conversion_rate:
 			self.conversion_rate = get_exchange_rate(
 				self.currency, self.company_currency(), args="for_buying"
 			)
+
+	@property
+	def has_stale_conversion_rate(self):
+		"""Currency changed without a new conversion rate."""
+		previous = self.get_doc_before_save()
+		if not previous:
+			return False
+
+		precision = self.precision("conversion_rate")
+		rate_unchanged = flt(previous.conversion_rate, precision) == flt(self.conversion_rate, precision)
+		return previous.currency != self.currency and rate_unchanged
 
 	def set_plc_conversion_rate(self):
 		if self.rm_cost_as_per in ["Valuation Rate", "Last Purchase Rate"]:
@@ -913,9 +926,12 @@ class BOM(WebsiteGenerator):
 
 		if self.price_list_currency == self.company_currency():
 			self.plc_conversion_rate = 1
-		elif flt(self.plc_conversion_rate) in (0, 1) or self.has_value_changed("buying_price_list"):
-			self.plc_conversion_rate = get_exchange_rate(
-				self.price_list_currency, self.company_currency(), args="for_buying"
+		elif self.price_list_currency == self.currency:
+			self.plc_conversion_rate = self.conversion_rate
+		else:
+			self.plc_conversion_rate = (
+				get_exchange_rate(self.price_list_currency, self.company_currency(), args="for_buying")
+				or self.plc_conversion_rate
 			)
 
 	def validate_materials(self):
@@ -1240,8 +1256,9 @@ class BOM(WebsiteGenerator):
 		return BOMTree(self.name)
 
 	def set_process_loss_qty(self):
-		if self.process_loss_percentage:
-			self.process_loss_qty = flt(self.quantity) * flt(self.process_loss_percentage) / 100
+		self.process_loss_qty = flt(
+			flt(self.quantity) * flt(self.process_loss_percentage) / 100, self.precision("process_loss_qty")
+		)
 
 		for item in self.secondary_items:
 			item.process_loss_qty = flt(
@@ -1319,9 +1336,6 @@ class BOM(WebsiteGenerator):
 
 	def calculate_exploded_cost(self):
 		return BOMCostingService(self).calculate_exploded_cost()
-
-	def get_rm_rate_map(self):
-		return BOMCostingService(self).get_rm_rate_map()
 
 	def update_exploded_items(self, save=True):
 		return BOMExplodedItemsService(self).update_exploded_items(save)

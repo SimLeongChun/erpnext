@@ -2744,6 +2744,31 @@ class TestPurchaseInvoice(ERPNextTestSuite, StockTestMixin):
 		rate = flt(sle.stock_value_difference) / flt(sle.actual_qty)
 		self.assertAlmostEqual(rate, 500)
 
+	def test_standalone_debit_note_rate_is_in_the_row_uom(self):
+		item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"valuation_method": "FIFO",
+				"uoms": [{"uom": "Box", "conversion_factor": 12}],
+			}
+		)
+		make_purchase_invoice(item_code=item.name, qty=6, rate=100, uom=item.stock_uom, update_stock=True)
+		make_purchase_invoice(item_code=item.name, qty=18, rate=200, uom=item.stock_uom, update_stock=True)
+
+		# a Box takes 6 at 100 and 6 at 200; a missing factor comes from the item
+		for uom, conversion_factor, rate in (("Box", 12, 1800), ("Box", 0, 1800), (item.stock_uom, 1, 100)):
+			returned_inv = make_purchase_invoice(
+				item_code=item.name,
+				qty=-1,
+				uom=item.stock_uom,
+				update_stock=True,
+				is_return=True,
+				do_not_save=True,
+			)
+			returned_inv.items[0].update({"uom": uom, "conversion_factor": conversion_factor, "rate": 0})
+			returned_inv.insert()
+			self.assertEqual(returned_inv.items[0].rate, rate)
+
 	@ERPNextTestSuite.change_settings("Accounts Settings", {"automatically_fetch_payment_terms": 1})
 	def test_payment_allocation_for_payment_terms(self):
 		from erpnext.buying.doctype.purchase_order.test_purchase_order import (
@@ -4169,7 +4194,10 @@ class TestPurchaseInvoice(ERPNextTestSuite, StockTestMixin):
 		first_return.items[0].qty = -4
 		first_return.save().submit()
 
-		self.assertEqual(first_return.items[0].received_qty, -10)
+		self.assertEqual(first_return.items[0].received_qty, 0)
+
+		# received_qty left on rows saved before it was reset without Update Stock
+		frappe.db.set_value("Purchase Invoice Item", first_return.items[0].name, "received_qty", -10)
 
 		second_return = make_return_doc(invoice.doctype, invoice.name)
 		second_return.items[0].qty = -6
@@ -4467,6 +4495,21 @@ class TestPurchaseInvoice(ERPNextTestSuite, StockTestMixin):
 		pr.items[0].qty = pr.items[0].received_qty = 4
 		pr.submit()
 		self.assertFalse(make_purchase_receipt_from_pi(pi.name).items)
+
+	def test_purchase_receipt_from_invoice_after_update_stock_turned_off(self):
+		from erpnext.accounts.doctype.purchase_invoice.mapper import (
+			make_purchase_receipt as make_purchase_receipt_from_pi,
+		)
+
+		pi = make_purchase_invoice(update_stock=1, qty=5, do_not_submit=True)
+		self.assertEqual(pi.items[0].received_qty, 5)
+
+		pi.update_stock = 0
+		pi.save()
+		pi.submit()
+
+		pr = make_purchase_receipt_from_pi(pi.name)
+		self.assertEqual(pr.items[0].qty, 5)
 
 	@ERPNextTestSuite.change_settings("Accounts Settings", {"enable_common_party_accounting": True})
 	def test_purchase_invoice_return_common_party_je_has_no_negative_amounts(self):

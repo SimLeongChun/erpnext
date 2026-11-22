@@ -74,24 +74,42 @@ def add_operating_cost_component_wise(stock_entry, work_order=None, op_expense_a
 		return False
 
 	cost_added = False
+	without_components = []
 	for row in work_order.operations:
 		if job_card and job_card.operation_id != row.name:
 			continue
 		if not row.actual_operation_time:
 			continue
-		if _add_operation_workstation_costs(stock_entry, work_order, row, op_expense_account):
+
+		workstation_cost = _get_operating_components(row)
+		if not workstation_cost:
+			without_components.append(row)
+		elif _add_operation_workstation_costs(
+			stock_entry, work_order, row, workstation_cost, op_expense_account
+		):
 			cost_added = True
+
+	if cost_added:
+		for row in without_components:
+			_add_operation_cost(stock_entry, work_order, row, op_expense_account)
 
 	return cost_added
 
 
-def _add_operation_workstation_costs(stock_entry, work_order, row, op_expense_account):
-	workstation_cost = frappe.get_all(
+def _get_operating_components(row):
+	# an operation planned on a Workstation Type has no workstation
+	parent, parenttype = (
+		(row.workstation, "Workstation") if row.workstation else (row.workstation_type, "Workstation Type")
+	)
+	return frappe.get_all(
 		"Workstation Cost",
 		fields=["operating_component", "operating_cost"],
-		filters={"parent": row.workstation, "parenttype": "Workstation", "operating_cost": (">", 0)},
+		filters={"parent": parent, "parenttype": parenttype, "operating_cost": (">", 0)},
 		order_by="idx",
 	)
+
+
+def _add_operation_workstation_costs(stock_entry, work_order, row, workstation_cost, op_expense_account):
 	total_component_rate = sum(flt(wc.operating_cost) for wc in workstation_cost)
 	if not (flt(row.actual_operating_cost) and total_component_rate):
 		return False
@@ -154,7 +172,7 @@ def add_operations_cost(stock_entry, work_order=None, expense_account=None, job_
 		)
 
 	_add_additional_operating_cost(stock_entry, work_order, expense_account, job_card)
-	_add_corrective_operation_cost(stock_entry, work_order, expense_account)
+	_add_corrective_operation_cost(stock_entry, work_order, expense_account, job_card)
 
 
 def _add_remaining_operating_cost(stock_entry, work_order, expense_account, job_card, remaining_cost):
@@ -224,11 +242,16 @@ def _add_fg_based_operating_cost(stock_entry, work_order, expense_account, job_c
 		_append_operating_cost(stock_entry, expense_account, unit_cost * flt(stock_entry.fg_completed_qty))
 
 
+def makes_semi_finished_good(work_order, job_card=None) -> bool:
+	"""Work order level costs go to the finished good, not to a semi-finished good of a job card."""
+	return bool(job_card and job_card.finished_good and job_card.finished_good != work_order.production_item)
+
+
 def _add_additional_operating_cost(stock_entry, work_order, expense_account, job_card=None):
 	if not (work_order and work_order.additional_operating_cost and work_order.qty):
 		return
 
-	if job_card and job_card.finished_good and job_card.finished_good != work_order.production_item:
+	if makes_semi_finished_good(work_order, job_card):
 		return
 
 	per_unit = flt(work_order.additional_operating_cost) / flt(work_order.qty)
@@ -245,8 +268,11 @@ def _add_additional_operating_cost(stock_entry, work_order, expense_account, job
 	)
 
 
-def _add_corrective_operation_cost(stock_entry, work_order, expense_account):
+def _add_corrective_operation_cost(stock_entry, work_order, expense_account, job_card=None):
 	if not (work_order and work_order.corrective_operation_cost and _corrective_cost_enabled()):
+		return
+
+	if makes_semi_finished_good(work_order, job_card):
 		return
 
 	max_qty = _max_operation_quantity(work_order) - work_order.produced_qty
@@ -274,6 +300,10 @@ def _max_operation_quantity(work_order):
 		)
 		.groupby(table.operation)
 	)
+	if work_order.track_semi_finished_goods:
+		# semi-finished good quantities are not finished good units
+		query = query.where(table.finished_good == work_order.production_item)
+
 	return min([d.qty for d in query.run(as_dict=True)], default=0)
 
 

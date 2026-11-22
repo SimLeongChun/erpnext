@@ -296,7 +296,7 @@ frappe.ui.form.on("Work Order", {
 
 	has_unreserved_stock(frm) {
 		let has_unreserved_stock = frm.doc.required_items.some(
-			(item) => flt(item.required_qty) > flt(item.stock_reserved_qty)
+			(item) => erpnext.stock_reservation.get_work_order_unreserved_qty(item) > 0
 		);
 
 		return has_unreserved_stock;
@@ -1036,12 +1036,7 @@ erpnext.work_order = {
 							frm.add_custom_button(
 								__("Material Consumption"),
 								function () {
-									const backflush_raw_materials_based_on =
-										frm.doc.__onload.backflush_raw_materials_based_on;
-									erpnext.work_order.make_consumption_se(
-										frm,
-										backflush_raw_materials_based_on
-									);
+									erpnext.work_order.make_consumption_se(frm);
 								},
 								__("Create")
 							);
@@ -1289,6 +1284,15 @@ erpnext.work_order = {
 		});
 	},
 
+	get_allowance_percentage: (frm, purpose) => {
+		// same as the server: transfers use Transfer Extra %, falling back to Overproduction %
+		const overproduction = flt(frm.doc.__onload?.overproduction_percentage);
+		if (purpose === "Material Transfer for Manufacture") {
+			return flt(frm.doc.__onload?.transfer_extra_materials_percentage) || overproduction;
+		}
+		return overproduction;
+	},
+
 	show_prompt_for_qty_input: function (frm, purpose, { qty, additional_transfer_entry, target } = {}) {
 		let max = qty == null ? this.get_max_transferable_qty(frm, purpose) : qty;
 		if (purpose === "Manufacture") {
@@ -1296,9 +1300,9 @@ erpnext.work_order = {
 		}
 		// a passed qty is already the caller's cap
 		const allowance =
-			qty == null ? (flt(frm.doc.qty) * flt(frm.doc.__onload?.overproduction_percentage)) / 100 : 0;
+			qty == null ? (flt(frm.doc.qty) * this.get_allowance_percentage(frm, purpose)) / 100 : 0;
 		const allowed_qty = flt(max + allowance, precision("qty"));
-		// only the overproduction allowance may be left
+		// only the allowance may be left
 		const default_qty = max || allowed_qty;
 		const pending_process_loss =
 			purpose === "Manufacture" ? this.get_pending_operation_process_loss(frm) : 0;
@@ -1455,24 +1459,13 @@ erpnext.work_order = {
 		}).then((data) => get_pick_list(data.qty));
 	},
 
-	make_consumption_se: function (frm, backflush_raw_materials_based_on) {
-		let max = 0;
-		if (!frm.doc.skip_transfer) {
-			max =
-				backflush_raw_materials_based_on === "Material Transferred for Manufacture"
-					? flt(frm.doc.material_transferred_for_manufacturing) - flt(frm.doc.produced_qty)
-					: flt(frm.doc.qty) - flt(frm.doc.produced_qty);
-			// flt(frm.doc.qty) - flt(frm.doc.material_transferred_for_manufacturing);
-		} else {
-			max = flt(frm.doc.qty) - flt(frm.doc.produced_qty);
-		}
-
+	make_consumption_se: function (frm) {
+		// the server proposes the qty still to consume
 		frappe.call({
 			method: "erpnext.manufacturing.doctype.work_order.mapper.make_stock_entry",
 			args: {
 				work_order_id: frm.doc.name,
 				purpose: "Material Consumption for Manufacture",
-				qty: max,
 			},
 			callback: function (r) {
 				var doclist = frappe.model.sync(r.message);

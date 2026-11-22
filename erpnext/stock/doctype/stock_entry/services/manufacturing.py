@@ -289,7 +289,6 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 		self.validate_manufactured_qty()
 		self.check_if_operations_completed()
 		self.check_duplicate_entry_for_work_order()
-		self.validate_component_and_quantities()
 		self.validate_finished_good_serial_batch_for_work_order()
 		self.validate_alternative_items()
 
@@ -790,19 +789,68 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 			return
 
 		for material in self.available_materials.values():
-			# a material is only covered by the entries that consumed it
-			pending_qty = transferred_qty - sum(material.consumed_for.values())
-			if flt(min(pending_qty_to_mfg, pending_qty) - fg_completed_qty, precision) <= 0:
+			pending_qty, covered_qty = self.get_material_pending_qty(
+				material, transferred_qty, pending_qty_to_mfg
+			)
+			if flt(covered_qty - fg_completed_qty, precision) <= 0:
 				# an entry for all that is pending consumes what is left
 				pending_qty = fg_completed_qty
 			self._append_transfer_based_rm(material, pending_qty)
+
+	def get_material_pending_qty(self, material, transferred_qty, pending_qty_to_mfg):
+		"""Qty the material left in WIP is for, and the part of it that is ready to manufacture."""
+		if self.wo_doc.transfer_material_against == "Job Card":
+			pending_qty = self.get_job_card_material_pending_qty(material, transferred_qty)
+			return pending_qty, pending_qty
+
+		# a material is only covered by the entries that consumed it
+		pending_qty = transferred_qty - sum(material.consumed_for.values())
+		return pending_qty, min(pending_qty_to_mfg, pending_qty)
+
+	def get_job_card_material_pending_qty(self, material, transferred_qty):
+		"""The Work Order's transferred qty follows the completed operations, not the moved material,
+		so use the item's moved share of its required qty, over its alternatives and warehouses."""
+		item_code = material.original_item or material.item_code
+		consumed_for = {}
+		for row in self.available_materials.values():
+			if (row.original_item or row.item_code) == item_code:
+				consumed_for.update(row.consumed_for)
+
+		# material moved in excess is spread over the order qty
+		transferred_for_qty = min(
+			self.get_material_transferred_for_qty(item_code), max(flt(self.wo_doc.qty), transferred_qty)
+		)
+		return transferred_for_qty - sum(consumed_for.values())
+
+	def get_material_transferred_for_qty(self, item_code):
+		"""Finished goods qty the item moved to WIP is for, as its share of the required qty."""
+		required_qty = sum(
+			flt(d.required_qty) for d in self.wo_doc.required_items if d.item_code == item_code
+		)
+		if not required_qty:
+			return flt(self.wo_doc.qty)
+
+		return self.transferred_qty_by_item[item_code] * flt(self.wo_doc.qty) / required_qty
+
+	@cached_property
+	def transferred_qty_by_item(self):
+		qty = defaultdict(float)
+		for row in self._transfer_entries:
+			qty[row.original_item or row.item_code] += flt(row.transfer_qty)
+
+		return qty
 
 	def _append_transfer_based_rm(self, row, pending_qty_to_mfg):
 		item_args = self.get_item_dict(row)
 		if row.original_item:
 			item_args["original_item"] = row.original_item
 		is_return = self.doc.get("is_return")
-		qty = row.qty if is_return else (flt(row.qty) * flt(self.doc.fg_completed_qty)) / pending_qty_to_mfg
+		# drop float noise only, so 7.000000000000001 is not ceiled to 8 and 0.004 still is to 1
+		qty = (
+			row.qty
+			if is_return
+			else flt(flt(row.qty) * flt(self.doc.fg_completed_qty) / pending_qty_to_mfg, 9)
+		)
 		item_args["qty"] = ceil_qty_if_uom_has_whole_number(qty, row.uom)
 		item_args["transfer_qty"] = item_args["qty"]
 		if not flt(item_args["qty"], frappe.get_precision("Stock Entry Detail", "qty")):
@@ -1376,14 +1424,16 @@ def get_production_item_details(work_order=None, bom_no=None):
 
 def _check_bom_component_qty(doc, bom_items):
 	"""Validate that stock entry items match BOM quantities."""
-	precision = frappe.get_precision("Stock Entry Detail", "qty")
+	precision = frappe.get_precision("Stock Entry Detail", "transfer_qty")
 	for row in bom_items:
-		row.qty = row.qty * doc.fg_completed_qty
+		# Get Items rounds a whole number qty up
+		row.qty = ceil_qty_if_uom_has_whole_number(row.qty * doc.fg_completed_qty, row.stock_uom)
 		matched_items = [
 			item for item in doc.items if item.s_warehouse and get_original_item(item) == row.item_code
 		]
 		if matched_items:
-			if flt(row.qty, precision) != flt(sum(flt(item.qty) for item in matched_items), precision):
+			stock_qty = sum(flt(item.transfer_qty) for item in matched_items)
+			if flt(row.qty, precision) != flt(stock_qty, precision):
 				frappe.throw(
 					_(
 						"For the item {0}, the consumed quantity should be {1} according to the BOM {2}."
@@ -1485,15 +1535,16 @@ def get_secondary_items(bom_no, work_order=None):
 		return get_bom_items(bom_no, fetch_secondary_items=True)
 
 
-def get_secondary_items_from_sub_assemblies(bom_no):
+def get_secondary_items_from_sub_assemblies(bom_no, qty=1):
+	"""Secondary items of the sub-assembly BOMs at every level, for qty of the BOM's item."""
 	items = []
-	bom_items = get_bom_items(bom_no)
+	bom_items = get_bom_items(bom_no, qty=qty)
 	for row in bom_items:
 		if not row.bom_no:
 			continue
 
 		items.extend(get_bom_items(row.bom_no, qty=row.qty, fetch_secondary_items=True))
-		items.extend(get_secondary_items_from_sub_assemblies(row.bom_no))
+		items.extend(get_secondary_items_from_sub_assemblies(row.bom_no, row.qty))
 
 	return items
 
@@ -1721,7 +1772,8 @@ def set_previous_operation_serial_batch(parent_doc, row):
 
 def ceil_qty_if_uom_has_whole_number(qty, stock_uom):
 	if cint(frappe.get_cached_value("UOM", stock_uom, "must_be_whole_number")):
-		qty = ceil(qty)
+		# rounding to 9 decimals first keeps float noise (0.07 * 100) from adding a unit
+		qty = ceil(flt(qty, 9))
 
 	return qty
 

@@ -67,6 +67,22 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 
 		self.assertFalse(frappe.db.exists("Stock Reservation Entry", reservation))
 
+	def test_delivery_cancel_reopens_only_its_own_reservation(self):
+		self.assertEqual(cancel_one_of_two_deliveries(-1), [(3, 3), (2, 0)])
+
+	def test_first_delivery_cancel_reopens_only_its_own_reservation(self):
+		self.assertEqual(cancel_one_of_two_deliveries(0), [(3, 0), (2, 2)])
+
+	def test_delivery_cancel_replays_an_earlier_cancelled_delivery(self):
+		scio = make_scio_with_two_manufactures()
+		first = make_delivery_of_qty(scio, 3)
+		second = make_delivery_of_qty(scio, 2)
+		first.cancel()
+		make_delivery_of_qty(scio, 3)
+		second.cancel()
+
+		self.assertEqual(get_delivered_reservations(scio), [(3, 3), (2, 0)])
+
 	def test_customer_provided_item_cost_field(self):
 		so, scio = create_so_scio()
 
@@ -786,6 +802,7 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 
 		scio.reload()
 		self.assertEqual(scio.items[0].produced_qty, 6)
+		self.assertEqual((scio.per_produced, scio.status), (120, "Produced"))
 
 		delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
 		self.assertEqual(delivery.items[0].qty, 5)
@@ -796,6 +813,9 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 			delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
 			self.assertEqual(delivery.items[0].qty, 6)
 			delivery.submit()
+
+		scio.reload()
+		self.assertEqual((scio.per_delivered, scio.status), (120, "Delivered"))
 
 	@ERPNextTestSuite.change_settings("Selling Settings", {"deliver_secondary_items": 1})
 	def test_secondary_items_delivery(self):
@@ -1729,6 +1749,33 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		for name in scio_names:
 			self.assertEqual(frappe.db.get_value("Subcontracting Inward Order", name, "status"), "Closed")
 
+	def test_holding_sales_order_keeps_a_closed_inward_order_closed(self):
+		from erpnext.selling.doctype.sales_order.sales_order import update_status
+		from erpnext.subcontracting.doctype.subcontracting_inward_order.subcontracting_inward_order import (
+			update_subcontracting_inward_order_status,
+		)
+
+		so, scio = create_so_scio()
+		update_subcontracting_inward_order_status(scio.name, "Closed")
+
+		update_status("On Hold", so.name)
+		self.assertEqual(frappe.db.get_value("Sales Order", so.name, "status"), "On Hold")
+		update_status("Draft", so.name)
+		self.assertEqual(frappe.db.get_value(scio.doctype, scio.name, "status"), "Closed")
+
+	def test_reopening_sales_order_keeps_a_closed_inward_order_closed(self):
+		from erpnext.selling.doctype.sales_order.sales_order import update_status
+		from erpnext.subcontracting.doctype.subcontracting_inward_order.subcontracting_inward_order import (
+			update_subcontracting_inward_order_status,
+		)
+
+		so, scio = create_so_scio()
+		update_subcontracting_inward_order_status(scio.name, "Closed")
+
+		update_status("Closed", so.name)
+		update_status("Draft", so.name)
+		self.assertEqual(frappe.db.get_value(scio.doctype, scio.name, "status"), "Closed")
+
 	def test_inward_order_from_closed_sales_order(self):
 		from erpnext.selling.doctype.sales_order.sales_order import update_status
 
@@ -1792,6 +1839,60 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		fg_return.save()
 
 		self.assertEqual(fg_return.items[0].expense_account, delivery_account)
+
+	def test_subcontracting_delivery_keeps_the_chosen_difference_account(self):
+		so, scio = create_manufactured_so_scio()
+		delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
+		delivery.save()
+		self.assertEqual(
+			delivery.items[0].expense_account,
+			frappe.get_cached_value("Company", delivery.company, "default_expense_account"),
+		)
+
+		delivery.items[0].expense_account = "Freight and Forwarding Charges - _TC"
+		delivery.save()
+		self.assertEqual(delivery.items[0].expense_account, "Freight and Forwarding Charges - _TC")
+
+	def test_subcontracting_return_uses_the_chosen_delivery_account(self):
+		so, scio = create_manufactured_so_scio()
+		delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
+		delivery.items[0].expense_account = "Freight and Forwarding Charges - _TC"
+		delivery.submit()
+
+		scio.reload()
+		fg_return = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_return())
+		self.assertEqual(fg_return.items[0].expense_account, "Freight and Forwarding Charges - _TC")
+
+	def test_subcontracting_return_account_over_several_deliveries(self):
+		freight, marketing = "Freight and Forwarding Charges - _TC", "Marketing Expenses - _TC"
+		so, scio = create_manufactured_so_scio()
+
+		def deliver(qty, account):
+			delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
+			delivery.items[0].update({"qty": qty, "expense_account": account})
+			delivery.submit()
+			scio.reload()
+			return delivery
+
+		def return_account():
+			scio.reload()
+			fg_return = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_return())
+			fg_return.items[0].update({"qty": 1, "t_warehouse": "_Test Warehouse - _TC"})
+			fg_return.save()
+			return fg_return.items[0].expense_account
+
+		deliver(3, freight)
+		second = deliver(2, freight)
+		self.assertEqual(return_account(), freight)
+
+		second.cancel()
+		third = deliver(2, marketing)
+		self.assertEqual(
+			return_account(), frappe.get_cached_value("Company", scio.company, "default_expense_account")
+		)
+
+		third.cancel()
+		self.assertEqual(return_account(), freight)
 
 	def test_extra_receipt_of_bom_item_uses_existing_row(self):
 		so, scio = create_so_scio()
@@ -1864,7 +1965,7 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 			)
 
 
-def create_delivered_so_scio():
+def create_manufactured_so_scio():
 	so, scio = create_so_scio()
 	frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward()).submit()
 	scio.reload()
@@ -1874,6 +1975,11 @@ def create_delivered_so_scio():
 	wo.submit()
 	frappe.new_doc("Stock Entry").update(make_stock_entry_from_wo(wo.name, "Manufacture")).submit()
 	scio.reload()
+	return so, scio
+
+
+def create_delivered_so_scio():
+	so, scio = create_manufactured_so_scio()
 	frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery()).submit()
 	scio.reload()
 	return so, scio
@@ -1950,3 +2056,44 @@ def create_so_scio(service_item="Service Item 1", fg_item="Basic FG Item"):
 	scio.submit()
 	scio.reload()
 	return so, scio
+
+
+def cancel_one_of_two_deliveries(index):
+	"""Deliver 3 and then 2, cancel delivery `index`; return each reservation's delivered qty."""
+	scio = make_scio_with_two_manufactures()
+	deliveries = [make_delivery_of_qty(scio, qty) for qty in (3, 2)]
+	deliveries[index].cancel()
+	return get_delivered_reservations(scio)
+
+
+def make_scio_with_two_manufactures():
+	"""Order with 3 and then 2 manufactured, each reserved for delivery."""
+	so, scio = create_so_scio()
+	frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward()).submit()
+	scio.reload()
+	wo = frappe.get_doc("Work Order", scio.make_work_order()[0])
+	wo.skip_transfer = 1
+	wo.required_items[-1].source_warehouse = "Stores - _TC"
+	wo.submit()
+	for qty in (3, 2):
+		frappe.new_doc("Stock Entry").update(make_stock_entry_from_wo(wo.name, "Manufacture", qty)).submit()
+
+	return scio
+
+
+def make_delivery_of_qty(scio, qty):
+	scio.reload()
+	delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
+	delivery.items[0].qty = qty
+	return delivery.submit()
+
+
+def get_delivered_reservations(scio):
+	reservations = frappe.get_all(
+		"Stock Reservation Entry",
+		filters={"voucher_detail_no": scio.items[0].name, "docstatus": 1},
+		fields=["reserved_qty", "delivered_qty"],
+		order_by="creation",
+		as_list=True,
+	)
+	return [tuple(reservation) for reservation in reservations]

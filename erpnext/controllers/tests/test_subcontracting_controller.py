@@ -64,11 +64,64 @@ class TestSubcontractingController(ERPNextTestSuite):
 		self.assertEqual(rate_without_additional_cost, sco.items[0].rate)
 		self.assertEqual(amount_without_additional_cost, sco.items[0].amount)
 
+	def test_additional_costs_split_by_amount_use_the_cost_before_them(self):
+		service_items = [
+			{
+				"warehouse": "_Test Warehouse - _TC",
+				"item_code": "Subcontracted Service Item 7",
+				"qty": 10,
+				"rate": 100,
+				"fg_item": "Subcontracted Item SA7",
+				"fg_item_qty": 10,
+			},
+			{
+				"warehouse": "_Test Warehouse - _TC",
+				"item_code": "Subcontracted Service Item 1",
+				"qty": 10,
+				"rate": 500,
+				"fg_item": "Subcontracted Item SA1",
+				"fg_item_qty": 10,
+			},
+		]
+		sco = get_subcontracting_order(service_items=service_items, do_not_submit=1)
+		sco.distribute_additional_costs_based_on = "Qty"
+		sco.append(
+			"additional_costs",
+			{"expense_account": "Cost of Goods Sold - _TC", "description": "Test", "amount": 1200},
+		)
+		sco.save()
+
+		sco.distribute_additional_costs_based_on = "Amount"
+		for _ in range(2):
+			sco.save()
+			costs = [item.qty * (item.rm_cost_per_qty + item.service_cost_per_qty) for item in sco.items]
+			for item, cost in zip(sco.items, costs, strict=True):
+				self.assertAlmostEqual(item.additional_cost_per_qty * item.qty, 1200 * cost / sum(costs))
+
 	def test_create_raw_materials_supplied(self):
 		sco = get_subcontracting_order()
 		sco.supplied_items = None
 		sco.create_raw_materials_supplied_or_received()
 		self.assertIsNotNone(sco.supplied_items)
+
+	def test_additional_cost_account_must_be_in_company_currency(self):
+		account = frappe.get_doc(
+			{
+				"doctype": "Account",
+				"account_name": "_Test USD Additional Cost",
+				"account_currency": "USD",
+				"company": "_Test Company",
+				"parent_account": "Indirect Expenses - _TC",
+				"account_type": "Expense Account",
+			}
+		).insert(ignore_if_duplicate=True)
+		sco = get_subcontracting_order(do_not_submit=1)
+		sco.append(
+			"additional_costs",
+			{"expense_account": account.name, "description": "Test", "amount": 10, "exchange_rate": 83},
+		)
+
+		self.assertRaises(frappe.ValidationError, sco.save)
 
 	@ERPNextTestSuite.change_settings("Buying Settings", {"allow_multiple_items": 1})
 	def test_sco_with_bom(self):

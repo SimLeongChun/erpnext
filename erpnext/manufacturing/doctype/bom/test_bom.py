@@ -2203,6 +2203,86 @@ class TestBOM(ERPNextTestSuite):
 
 		self.assertEqual(bom.items[0].rate, 5)
 
+	def test_exploded_item_used_at_two_rates_merges_at_weighted_rate(self):
+		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
+		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+
+		rm_item = make_item(properties={"is_stock_item": 1}).name
+		sub_item = make_item(properties={"is_stock_item": 1}).name
+		make_stock_entry(item_code=rm_item, qty=100, rate=10, target="_Test Warehouse - _TC")
+		make_stock_entry(item_code=rm_item, qty=10, rate=50, target="_Test Warehouse 1 - _TC")
+		sub_bom = make_bom(item=sub_item, raw_materials=[rm_item], currency="INR", do_not_save=True)
+		sub_bom.items[0].source_warehouse = "_Test Warehouse - _TC"
+		sub_bom.insert()
+		sub_bom.submit()
+
+		bom = make_bom(
+			item=make_item(properties={"is_stock_item": 1}).name,
+			raw_materials=[rm_item],
+			currency="INR",
+			do_not_save=True,
+		)
+		bom.items[0].source_warehouse = "_Test Warehouse 1 - _TC"
+		bom.append("items", {"item_code": sub_item, "qty": 1, "bom_no": sub_bom.name})
+		bom.insert()
+		bom.submit()
+		self.assertEqual(bom.raw_material_cost, 60)
+
+		def assert_exploded_row(rate, amount):
+			row = bom.exploded_items[0]
+			self.assertEqual(
+				(len(bom.exploded_items), row.stock_qty, row.rate, row.amount), (1, 2, rate, amount)
+			)
+
+		assert_exploded_row(30, 60)
+		make_stock_entry(item_code=rm_item, qty=10, rate=150, target="_Test Warehouse 1 - _TC")
+		bom.update_cost()
+		bom.reload()
+		self.assertEqual(bom.raw_material_cost, 110)
+		assert_exploded_row(55, 110)
+
+	def test_clearing_process_loss_percentage_clears_process_loss_qty(self):
+		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
+
+		rm_item = make_item(properties={"is_stock_item": 1, "valuation_rate": 10}).name
+		sub_item = make_item(properties={"is_stock_item": 1}).name
+		bom = make_bom(
+			item=sub_item,
+			raw_materials=[rm_item],
+			quantity=10,
+			rm_qty=10,
+			process_loss_percentage=10,
+			do_not_submit=True,
+		)
+		self.assertEqual(bom.process_loss_qty, 1)
+
+		bom.process_loss_percentage = 0
+		bom.save()
+		self.assertEqual(bom.process_loss_qty, 0)
+
+	def test_price_list_in_bom_currency_uses_bom_conversion_rate(self):
+		price_list = make_usd_buying_price_list(83)
+		rm_item = make_item(properties={"is_stock_item": 1}).name
+		frappe.get_doc(
+			{"doctype": "Item Price", "item_code": rm_item, "price_list": price_list, "price_list_rate": 10}
+		).insert()
+
+		bom = make_usd_bom(
+			make_item(properties={"is_stock_item": 1}).name,
+			[{"item_code": rm_item, "qty": 1}],
+			rm_cost_as_per="Price List",
+			buying_price_list=price_list,
+		)
+
+		# the BOM's own conversion rate (80) applies, not the exchange rate (83)
+		self.assertEqual(bom.plc_conversion_rate, 80)
+		self.assertEqual(bom.items[0].rate, 10)
+
+		# a row fetched on a form still holding the exchange rate
+		bom.plc_conversion_rate = 83
+		detail = bom.get_bom_material_detail({"item_code": rm_item, "qty": 1, "fetch_rate": True})
+		self.assertEqual(detail["rate"], 10)
+
 	def test_price_list_rate_valid_today(self):
 		price_list = frappe.get_doc(
 			{
@@ -2265,6 +2345,23 @@ class TestBOM(ERPNextTestSuite):
 			bom.name, "_Test Company", fetch_exploded=0, fetch_qty_in_stock_uom=False
 		)[rm_item]
 		self.assertEqual((in_row_uom.qty, in_row_uom.rate), (1, 120))
+
+	def test_currency_change_fetches_conversion_rate(self):
+		set_inr_exchange_rate("EUR", 90)
+		bom = frappe.get_doc(
+			{
+				"doctype": "BOM",
+				"item": make_item(properties={"is_stock_item": 1}).name,
+				"company": "_Test Company",
+				"currency": "USD",
+				"conversion_rate": 80.0000000001,  # beyond the field precision
+				"items": [{"item_code": make_item(properties={"is_stock_item": 1}).name, "qty": 1}],
+			}
+		).insert()
+
+		bom.currency = "EUR"
+		bom.save()
+		self.assertEqual(bom.conversion_rate, 90)
 
 
 def make_stage_items():
@@ -2482,20 +2579,24 @@ def make_usd_buying_price_list(exchange_rate):
 			}
 		).insert()
 
+	set_inr_exchange_rate("USD", exchange_rate)
+	return price_list
+
+
+def set_inr_exchange_rate(currency, exchange_rate):
 	today = frappe.utils.nowdate()
-	frappe.db.delete("Currency Exchange", {"date": today, "from_currency": "USD", "to_currency": "INR"})
+	frappe.db.delete("Currency Exchange", {"date": today, "from_currency": currency, "to_currency": "INR"})
 	frappe.get_doc(
 		{
 			"doctype": "Currency Exchange",
 			"date": today,
-			"from_currency": "USD",
+			"from_currency": currency,
 			"to_currency": "INR",
 			"exchange_rate": exchange_rate,
 			"for_buying": 1,
 			"for_selling": 1,
 		}
 	).insert()
-	return price_list
 
 
 def make_usd_bom(item, items, **values):
