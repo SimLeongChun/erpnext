@@ -1396,6 +1396,75 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 			7,
 		)
 
+	def test_return_extra_customer_material_held_by_work_order(self):
+		scio, wo = make_work_order_with_extra_material()
+		rm_return = frappe.new_doc("Stock Entry").update(scio.make_rm_return())
+		self.assertEqual([(row.item_code, row.qty) for row in rm_return.items], [("Basic RM", 2)])
+		rm_return.submit()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Work Order Item", {"parent": wo.name, "item_code": "Basic RM"}, "stock_reserved_qty"
+			),
+			5,
+		)
+		frappe.new_doc("Stock Entry").update(make_stock_entry_from_wo(wo.name, "Manufacture", 5)).submit()
+
+	def test_cancelled_return_gives_work_order_back_its_reservation(self):
+		scio, wo = make_work_order_with_extra_material()
+		rm_return = frappe.new_doc("Stock Entry").update(scio.make_rm_return())
+		rm_return.submit()
+		rm_return.cancel()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Work Order Item", {"parent": wo.name, "item_code": "Basic RM"}, "stock_reserved_qty"
+			),
+			7,
+		)
+		manufacture = frappe.new_doc("Stock Entry").update(
+			make_stock_entry_from_wo(wo.name, "Manufacture", 5)
+		)
+		next(row for row in manufacture.items if row.item_code == "Basic RM").qty = 7
+		manufacture.submit()
+
+	def test_return_customer_material_left_over_by_completed_work_order(self):
+		scio, wo = make_work_order_with_extra_material()
+		frappe.new_doc("Stock Entry").update(make_stock_entry_from_wo(wo.name, "Manufacture", 5)).submit()
+
+		scio.reload()
+		frappe.new_doc("Stock Entry").update(scio.make_rm_return()).submit()
+		self.assertEqual(
+			frappe.db.get_value(
+				"Work Order Item", {"parent": wo.name, "item_code": "Basic RM"}, "stock_reserved_qty"
+			),
+			0,
+		)
+
+	def test_redo_cancelled_manufacture_using_extra_customer_material(self):
+		scio, wo = make_work_order_with_extra_material()
+		manufacture = frappe.new_doc("Stock Entry").update(
+			make_stock_entry_from_wo(wo.name, "Manufacture", 5)
+		)
+		manufacture.submit()
+		manufacture.cancel()
+
+		redo = frappe.new_doc("Stock Entry").update(make_stock_entry_from_wo(wo.name, "Manufacture", 5))
+		next(row for row in redo.items if row.item_code == "Basic RM").qty = 7
+		redo.submit()
+
+	def test_no_return_of_extra_customer_material_consumed_by_work_order(self):
+		scio, wo = make_work_order_with_extra_material()
+		manufacture = frappe.new_doc("Stock Entry").update(
+			make_stock_entry_from_wo(wo.name, "Manufacture", 5)
+		)
+		next(row for row in manufacture.items if row.item_code == "Basic RM").qty = 7
+		manufacture.submit()
+
+		scio.reload()
+		rm_return = frappe.new_doc("Stock Entry").update(scio.make_rm_return())
+		self.assertFalse([row for row in rm_return.items if row.item_code == "Basic RM"])
+
 	def test_cancelled_manufacture_of_closed_work_order_keeps_the_rest_consumed(self):
 		from erpnext.manufacturing.doctype.work_order.services.reservation import (
 			make_stock_reservation_entries,
@@ -1554,6 +1623,52 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		scio.reload()
 		rm_return = frappe.new_doc("Stock Entry").update(scio.make_rm_return())
 		self.assertEqual([(item.item_code, item.qty) for item in rm_return.items], [("Basic RM", 2)])
+
+	def test_rm_return_counts_every_row_of_one_received_item(self):
+		so, scio = create_so_scio()
+		frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward()).submit()
+		make_stock_entry(
+			item_code="Basic RM", qty=5, to_warehouse=scio.customer_warehouse, purpose="Material Receipt"
+		)
+		scio.reload()
+		rm_return = frappe.new_doc("Stock Entry").update(scio.make_rm_return())
+		rm_return.items = [item for item in rm_return.items if item.item_code == "Basic RM"]
+		rm_return.append("items", rm_return.items[0].as_dict(no_default_fields=True))
+		self.assertRaises(frappe.ValidationError, rm_return.submit)
+
+		rm_return.items[0].qty = 3
+		rm_return.items[1].qty = 2
+		rm_return.submit()
+		scio.reload()
+		self.assertEqual(scio.received_items[0].returned_qty, 5)
+
+	def test_patch_recounts_returned_qty_of_split_returns(self):
+		from erpnext.patches.v16_0.recalculate_returned_qty_of_customer_material_returned_in_parts import (
+			execute,
+		)
+
+		so, scio = create_so_scio()
+		frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward()).submit()
+		scio.reload()
+		rm_return = frappe.new_doc("Stock Entry").update(scio.make_rm_return())
+		rm_return.items = [item for item in rm_return.items if item.item_code == "Basic RM"]
+		rm_return.append("items", rm_return.items[0].as_dict(no_default_fields=True))
+		rm_return.items[0].qty = 3
+		rm_return.items[1].qty = 2
+		rm_return.submit()
+		row = rm_return.items[0].scio_detail
+		doctype = "Subcontracting Inward Order Received Item"
+
+		# stored before split returns were summed
+		frappe.db.set_value(doctype, row, "returned_qty", 2)
+		execute()
+		self.assertEqual(frappe.db.get_value(doctype, row, "returned_qty"), 5)
+
+		# cancelled after the sum was deployed but before the patch ran
+		rm_return.cancel()
+		frappe.db.set_value(doctype, row, "returned_qty", -3)
+		execute()
+		self.assertEqual(frappe.db.get_value(doctype, row, "returned_qty"), 0)
 
 	def test_partly_subcontracted_service_item_in_larger_uom(self):
 		item_list = [
@@ -1825,6 +1940,50 @@ class IntegrationTestSubcontractingInwardOrder(ERPNextTestSuite):
 		delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
 		self.assertFalse([item for item in delivery.items if item.is_finished_item])
 
+	def test_delivery_and_return_limits_cover_every_row_of_one_item(self):
+		so, scio = create_so_scio()
+		frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward()).submit()
+		scio.reload()
+		wo = frappe.get_doc("Work Order", scio.make_work_order()[0])
+		wo.skip_transfer = 1
+		wo.required_items[-1].source_warehouse = "Stores - _TC"
+		wo.submit()
+		frappe.new_doc("Stock Entry").update(make_stock_entry_from_wo(wo.name, "Manufacture")).submit()
+		make_stock_entry(
+			item_code="Basic FG Item",
+			qty=5,
+			to_warehouse="_Test Warehouse - _TC",
+			purpose="Material Receipt",
+			rate=100,
+		)
+		scio.reload()
+		delivery = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_delivery())
+		delivery.append("items", delivery.items[0].as_dict(no_default_fields=True))
+		self.assertRaises(frappe.ValidationError, delivery.submit)
+
+		delivery.items = [delivery.items[0], delivery.items[-1]]
+		delivery.items[0].qty = 3
+		delivery.items[1].qty = 2
+		delivery.submit()
+		scio.reload()
+		self.assertEqual(scio.items[0].delivered_qty, 5)
+
+		fg_return = frappe.new_doc("Stock Entry").update(scio.make_subcontracting_return())
+		fg_return.items[0].t_warehouse = "_Test Warehouse - _TC"
+		fg_return.append("items", fg_return.items[0].as_dict(no_default_fields=True))
+		self.assertRaises(frappe.ValidationError, fg_return.submit)
+
+		fg_return.items[0].qty = 3
+		fg_return.items[1].qty = 2
+		fg_return.submit()
+		scio.reload()
+		self.assertEqual(scio.items[0].returned_qty, 5)
+
+		fg_return.cancel()
+		delivery.cancel()
+		scio.reload()
+		self.assertEqual((scio.items[0].delivered_qty, scio.items[0].returned_qty), (0, 0))
+
 	def test_subcontracting_return_uses_delivery_expense_account(self):
 		so, scio = create_delivered_so_scio()
 		delivery_account = frappe.db.get_value(
@@ -2046,6 +2205,20 @@ def receive_customer_material(scio, rm_item, qty, rate):
 	rm_in.submit()
 	scio.reload()
 	return rm_in
+
+
+def make_work_order_with_extra_material():
+	"""Receive 7 Basic RM for an order that needs 5 and make one Work Order for all of it."""
+	so, scio = create_so_scio()
+	rm_in = frappe.new_doc("Stock Entry").update(scio.make_rm_stock_entry_inward())
+	next(row for row in rm_in.items if row.item_code == "Basic RM").qty = 7
+	rm_in.submit()
+	scio.reload()
+	wo = frappe.get_doc("Work Order", scio.make_work_order()[0])
+	wo.skip_transfer = 1
+	wo.required_items[-1].source_warehouse = "Stores - _TC"
+	wo.submit()
+	return scio, wo
 
 
 def create_so_scio(service_item="Service Item 1", fg_item="Basic FG Item"):
