@@ -22,6 +22,7 @@ from erpnext.controllers.accounts_controller import AccountsController
 from erpnext.controllers.sales_and_purchase_return import (
 	available_serial_batch_for_return,
 	filter_serial_batches,
+	get_return_reference_field,
 	make_serial_batch_bundle_for_return,
 )
 
@@ -318,6 +319,87 @@ class StockController(AccountsController):
 			exclude_serial_nos,
 			total_qty,
 		)
+
+	def get_return_stock_qty(self, row, qty, warehouse) -> float:
+		"""Stock qty a return row moves, signed as its qty: no more than its original row moved in the
+		warehouse, less the row's other returns, and all that is left once it returns the rest of the
+		row's qty."""
+		from erpnext.controllers.buying_controller import get_stock_qty
+
+		stock_qty = get_stock_qty(row, qty)
+		if self.docstatus == 2:
+			return flt(self.get_posted_return_qty(row, warehouse)) or stock_qty
+
+		left = self.get_row_left_to_return(row, warehouse)
+		if flt(left.stock_qty) <= 0:
+			return stock_qty
+
+		unreturned_stock_qty = left.unrounded_stock_qty + flt(qty) * flt(row.conversion_factor)
+		if flt(unreturned_stock_qty, row.precision("stock_qty")) <= 0:
+			return -left.stock_qty
+
+		return max(stock_qty, -left.stock_qty)
+
+	def get_row_left_to_return(self, row, warehouse) -> frappe._dict:
+		"""Unrounded and posted stock qty the returned original row moved in the warehouse that its other
+		returns have not moved back. A delivery counts every warehouse its rows used, as a return can put
+		its stock back in another one."""
+		from erpnext.controllers.buying_controller import get_posted_stock_qty_by_row
+
+		left = frappe._dict(unrounded_stock_qty=0.0, stock_qty=0.0)
+		reference_field = get_return_reference_field(self.doctype)
+		original_row = row.get(reference_field)
+		if not original_row:
+			return left
+
+		item = frappe.qb.DocType(row.doctype)
+		fields = [item.name, item.qty, item.conversion_factor, item.warehouse]
+		if frappe.get_meta(row.doctype).has_field("rejected_warehouse"):
+			fields += [item.rejected_qty, item.rejected_warehouse]
+
+		rows = (
+			frappe.qb.from_(item)
+			.select(*fields)
+			.where(
+				(item.docstatus == 1)
+				& (
+					(item.name == original_row)
+					| ((item[reference_field] == original_row) & (item.parent != self.name))
+				)
+			)
+			.run(as_dict=True)
+		)
+		warehouses = [warehouse] if self.is_stock_receipt() else list({d.warehouse for d in rows})
+		posted_qty = get_posted_stock_qty_by_row([d.name for d in rows], warehouses)
+		for d in rows:
+			if d.name not in posted_qty:
+				continue  # moved no stock, like a return without Update Stock
+			if d.warehouse in warehouses:
+				left.unrounded_stock_qty += flt(d.qty) * flt(d.conversion_factor)
+			if d.get("rejected_warehouse") in warehouses:
+				left.unrounded_stock_qty += flt(d.rejected_qty) * flt(d.conversion_factor)
+
+		left.stock_qty = flt(sum(posted_qty.values()) * self.get_stock_qty_sign(), row.precision("stock_qty"))
+		return left
+
+	def get_posted_return_qty(self, row, warehouse):
+		"""Qty the return row's entry moved in the warehouse, signed as its qty."""
+		sign = self.get_stock_qty_sign()
+		actual_qty = frappe.db.get_value(
+			"Stock Ledger Entry",
+			{
+				"voucher_detail_no": row.name,
+				"warehouse": warehouse,
+				"is_cancelled": 0,
+				"actual_qty": ("<", 0) if sign > 0 else (">", 0),
+			},
+			"actual_qty",
+		)
+		return flt(actual_qty) * sign
+
+	def get_stock_qty_sign(self) -> int:
+		"""1 where a row's stock qty goes into the warehouse, as on a receipt, -1 where it goes out."""
+		return 1 if self.is_stock_receipt() else -1
 
 	def get_sl_entries(self, d, args):
 		from erpnext.stock.services.stock_ledger_service import StockLedgerService
@@ -941,6 +1023,23 @@ def show_accounting_ledger_preview(company: str, doctype: str, docname: str):
 
 
 @frappe.whitelist()
+def show_payment_ledger_preview(company: str, doctype: str, docname: str):
+	from erpnext.controllers.ledger_preview import get_payment_ledger_preview
+
+	filters = frappe._dict(company=company)
+	doc = frappe.get_lazy_doc(doctype, docname)
+	doc.check_permission("read")
+	frappe.has_permission("Payment Ledger Entry", "read", throw=True)
+	doc.run_method("before_gl_preview")
+
+	pl_columns, pl_data = get_payment_ledger_preview(doc, filters)
+
+	frappe.db.rollback()
+
+	return {"pl_columns": pl_columns, "pl_data": pl_data}
+
+
+@frappe.whitelist()
 def show_stock_ledger_preview(company: str, doctype: str, docname: str):
 	from erpnext.controllers.ledger_preview import get_stock_ledger_preview
 
@@ -1107,15 +1206,21 @@ def future_sle_exists(args, sl_entries=None, for_update=False):
 
 	or_conditions = get_conditions_to_validate_future_sle(sl_entries)
 
-	args["posting_datetime"] = get_combine_datetime(args["posting_date"], args["posting_time"])
+	posting_datetime = get_combine_datetime(args["posting_date"], args["posting_time"])
+	args["posting_datetime"] = posting_datetime
 
 	sle = frappe.qb.DocType("Stock Ledger Entry")
+	# same-time entries sort by creation, so only those created after this voucher's come later
+	is_later = sle.posting_datetime > posting_datetime
+	if creation := get_voucher_sle_creation(args):
+		is_later |= (sle.posting_datetime == posting_datetime) & (sle.creation > creation)
+
 	query = (
 		frappe.qb.from_(sle)
 		.select(sle.item_code, sle.warehouse, Count(sle.name).as_("total_row"))
 		.where(
 			Criterion.any(or_conditions)
-			& (sle.posting_datetime >= args["posting_datetime"])
+			& is_later
 			& (sle.voucher_no != args["voucher_no"])
 			& (sle.is_cancelled == 0)
 		)
@@ -1165,6 +1270,16 @@ def get_cached_data(args, key):
 		return True if (count or count == 0) else False
 	else:
 		return frappe.local.future_sle[key]
+
+
+def get_voucher_sle_creation(args):
+	"""Creation of the voucher's first SLE, cancelled ones included."""
+	return frappe.db.get_value(
+		"Stock Ledger Entry",
+		{"voucher_type": args.voucher_type, "voucher_no": args.voucher_no},
+		"creation",
+		order_by="creation asc",
+	)
 
 
 def get_sle_entries_against_voucher(args):
@@ -1292,6 +1407,7 @@ def make_bundle_for_material_transfer(**kwargs):
 
 	bundle_doc = frappe.copy_doc(bundle_doc)
 	bundle_doc.docstatus = 0
+	bundle_doc.company = kwargs.company or bundle_doc.company
 	bundle_doc.warehouse = kwargs.warehouse
 	bundle_doc.type_of_transaction = kwargs.type_of_transaction
 	bundle_doc.voucher_type = kwargs.voucher_type
