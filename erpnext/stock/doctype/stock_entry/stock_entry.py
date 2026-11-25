@@ -28,6 +28,7 @@ from erpnext.manufacturing.doctype.bom.bom import (
 	validate_bom_no,
 )
 from erpnext.manufacturing.doctype.work_order.mapper import get_upstream_process_loss
+from erpnext.manufacturing.doctype.work_order.services.required_items import get_allowed_transfer_qty
 from erpnext.setup.doctype.brand.brand import get_brand_defaults
 from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
 from erpnext.stock import stock_ledger
@@ -371,9 +372,12 @@ class StockEntry(StockController, SubcontractingInwardController):
 		if self.purpose_cls:
 			self.purpose_cls(self).validate()
 
+		# rows of every purpose count towards the Material Request
+		MaterialRequestStockEntry(self).validate_material_request()
 		self.validate_warehouses_company()
 		sbb.validate_duplicate_serial_and_batch_bundle("items")
 		self.validate_posting_time()
+		MaterialTransferStockEntry(self).validate_posting_datetime_with_outgoing_entry()
 		self.validate_item()
 		validate_item_uoms(self.get("items"))
 		self.validate_customer_provided_item()
@@ -2297,10 +2301,14 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 			transfer_qty[d.pick_list_item] += flt(d.transfer_qty)
 			transferred_qty = flt(flt(picked_row.transferred_qty) + transfer_qty[d.pick_list_item], precision)
-			if transferred_qty > flt(picked_row.picked_qty):
+			allowed_qty = flt(
+				get_allowed_transfer_qty(picked_row.picked_qty) if self.work_order else picked_row.picked_qty,
+				precision,
+			)
+			if transferred_qty > allowed_qty:
 				frappe.throw(
-					_("Row #{0}: Item {1} is transferred more than the {2} picked in {3}.").format(
-						d.idx, frappe.bold(d.item_code), flt(picked_row.picked_qty), self.pick_list
+					_("Row #{0}: Item {1} is transferred more than the {2} allowed in {3}.").format(
+						d.idx, frappe.bold(d.item_code), allowed_qty, self.pick_list
 					)
 				)
 
