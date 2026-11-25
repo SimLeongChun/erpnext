@@ -3961,6 +3961,111 @@ class TestTaxWithholdingCategory(ERPNextTestSuite):
 
 		self.cleanup_invoices([pi])
 
+	def make_single_and_cumulative_category(self, round_off_tax_amount=0, name="Single And Cumulative TDS"):
+		fiscal_year = get_fiscal_year(today(), company="_Test Company")
+		return create_tax_withholding_category(
+			category_name=name,
+			rate=10,
+			from_date=fiscal_year[1],
+			to_date=fiscal_year[2],
+			account="TDS - _TC",
+			single_threshold=30000,
+			cumulative_threshold=100000,
+			round_off_tax_amount=round_off_tax_amount,
+		)
+
+	def get_gl_balance(self, voucher_nos, account):
+		return sum(
+			d.debit - d.credit
+			for d in frappe.get_all(
+				"GL Entry",
+				filters={"voucher_no": ["in", voucher_nos], "account": account, "is_cancelled": 0},
+				fields=["debit", "credit"],
+			)
+		)
+
+	def test_cancel_invoice_that_withheld_tax_for_returned_invoice(self):
+		self.make_single_and_cumulative_category()
+		self.setup_party_with_category("Supplier", "Test TDS Supplier6", "Single And Cumulative TDS")
+
+		pi_a = create_purchase_invoice(supplier="Test TDS Supplier6", rate=20000)
+		pi_a.submit()
+		self.assertEqual(pi_a.taxes_and_charges_deducted, 0)
+
+		pi_b = create_purchase_invoice(supplier="Test TDS Supplier6", rate=40000)
+		pi_b.submit()
+		self.assertEqual(pi_b.taxes_and_charges_deducted, 6000)
+
+		debit_note = create_purchase_invoice(
+			supplier="Test TDS Supplier6", rate=20000, qty=-1, is_return=1, do_not_save=True
+		)
+		debit_note.return_against = pi_a.name
+		debit_note.save()
+		debit_note.submit()
+		self.assertEqual(debit_note.taxes_and_charges_deducted, -2000)
+
+		# the failed cancel is not rolled back by the test runner
+		frappe.db.savepoint("before_cancel")
+		pi_b.reload()
+		self.assertRaises(frappe.ValidationError, pi_b.cancel)
+		frappe.db.rollback(save_point="before_cancel")
+
+		debit_note.reload()
+		debit_note.cancel()
+		pi_b.reload()
+		pi_b.cancel()
+
+		vouchers = [pi_a.name, pi_b.name, debit_note.name]
+		self.assertEqual(self.get_gl_balance(vouchers, "TDS - _TC"), 0)
+
+	def make_supplier_journal(self, voucher_type, expense_account, amount, apply_tds=1):
+		jv = make_journal_entry_with_tax_withholding(
+			party_type="Supplier",
+			party="Test TDS Supplier6",
+			voucher_type=voucher_type,
+			amount=amount,
+			save=False,
+		)
+		jv.accounts[0].account = expense_account
+		jv.apply_tds = apply_tds
+		jv.tax_withholding_category = "Single And Cumulative TDS"
+		jv.save()
+		return jv
+
+	def test_journal_entry_removes_tds_row_when_not_applicable(self):
+		self.make_single_and_cumulative_category()
+		self.setup_party_with_category("Supplier", "Test TDS Supplier6", "Single And Cumulative TDS")
+
+		jv = self.make_supplier_journal("Debit Note", "Legal Expenses - _TC", 50000)
+		party_row = next(d for d in jv.accounts if d.party_type == "Supplier")
+		self.assertEqual(party_row.credit, 45000)
+
+		jv.apply_tds = 0
+		jv.save()
+		party_row = next(d for d in jv.accounts if d.party_type == "Supplier")
+		self.assertFalse([d for d in jv.accounts if d.is_tax_withholding_account])
+		self.assertEqual(party_row.credit, 50000)
+		self.assertFalse(jv.tax_withholding_entries)
+
+	def test_journal_entry_removes_tds_row_below_threshold(self):
+		self.make_single_and_cumulative_category()
+		self.setup_party_with_category("Supplier", "Test TDS Supplier6", "Single And Cumulative TDS")
+
+		jv = self.make_supplier_journal("Debit Note", "Legal Expenses - _TC", 50000)
+		# lower the expense, keep the 5,000 TDS row of the first save
+		jv.accounts[0].debit_in_account_currency = 20000
+		jv.accounts[1].credit_in_account_currency = 15000
+		jv.save()
+
+		party_row = next(d for d in jv.accounts if d.party_type == "Supplier")
+		self.assertFalse([d for d in jv.accounts if d.is_tax_withholding_account])
+		self.assertEqual(party_row.credit, 20000)
+		self.assertEqual(jv.tax_withholding_entries[0].taxable_amount, 20000)
+		self.assertEqual(jv.tax_withholding_entries[0].withholding_amount, 0)
+
+		jv.submit()
+		self.assertEqual(self.get_gl_balance([jv.name], "TDS - _TC"), 0)
+
 
 def create_purchase_invoice(**args):
 	# return sales invoice doc object

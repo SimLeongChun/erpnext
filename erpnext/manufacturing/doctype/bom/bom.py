@@ -251,6 +251,17 @@ class BOM(WebsiteGenerator):
 		super().onload()
 
 		self.set_onload_for_multi_level_bom()
+		# the form previews these per batch, as is_costed_per_batch does
+		operations = list({row.operation for row in self.operations if row.operation})
+		self.set_onload(
+			"batch_based_operations",
+			operations
+			and frappe.get_all(
+				"Operation",
+				filters={"name": ("in", operations), "create_job_card_based_on_batch_size": 1},
+				pluck="name",
+			),
+		)
 
 	def set_onload_for_multi_level_bom(self):
 		use_multi_level_bom = frappe.db.get_value(
@@ -1406,6 +1417,15 @@ def _get_price_list_item_rate(args, bom_doc):
 	return price_list_data.price_list_rate
 
 
+@frappe.whitelist()
+def get_secondary_item_valuation_rate(item_code: str, company: str, warehouse: str | None = None) -> float:
+	"""Company currency rate a Valuation Rate secondary item is costed at."""
+	frappe.has_permission("BOM", "read", throw=True)
+	return get_valuation_rate(
+		{"item_code": item_code, "company": company, "warehouse": warehouse, "set_rate_based_on_warehouse": 1}
+	)
+
+
 def get_valuation_rate(data):
 	"""
 	1) Get average valuation rate from the scoping warehouse if one is passed
@@ -1647,7 +1667,7 @@ def _add_bom_item_columns(query, t, bom, opts, track_semi_finished_goods):
 	is_stock_item = cint(not opts.include_non_stock_items)
 	stock_item_condition = t.item_doc.is_stock_item.isin([1, is_stock_item])
 	if opts.fetch_secondary_items:
-		return _add_secondary_item_columns(query, t, stock_item_condition)
+		return _add_secondary_item_columns(query, t, opts.qty, stock_item_condition)
 
 	# BOM Item rate is per row UOM, while BOM Explosion Item rate is per stock UOM. Select the
 	# matching quantity so a normal BOM row's conversion factor is not applied twice.
@@ -1693,14 +1713,14 @@ def _add_exploded_item_columns(query, t, bom, amount_col, stock_item_condition):
 	return query, [t.bom_item.item_code, t.item_doc.stock_uom, t.bom_item.operation]
 
 
-def _add_secondary_item_columns(query, t, stock_item_condition):
+def _add_secondary_item_columns(query, t, qty, stock_item_condition):
 	# grouped by (item_code, secondary_item_type), which the BOM keeps unique, so every Max()
 	# below returns the single grouped row's own value while keeping the GROUP BY valid on
 	# postgres.
 	query = query.select(
 		Max(t.item_doc.description).as_("description"),
 		Max(t.bom_item.cost_allocation_per).as_("cost_allocation_per"),
-		Max(t.bom_item.process_loss_per).as_("process_loss_per"),
+		(Sum(t.bom_item.process_loss_qty / IfNull(t.bom_doc.quantity, 1)) * qty).as_("process_loss_qty"),
 		t.bom_item.secondary_item_type,
 		Max(t.bom_item.name).as_("name"),
 	).where(stock_item_condition)

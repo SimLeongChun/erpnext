@@ -8,6 +8,7 @@ from frappe.query_builder.functions import Coalesce, IfNull, Max, Min, NullIf, S
 from frappe.utils import ceil, cint, flt, get_link_to_form
 
 from erpnext.manufacturing.doctype.bom.bom import add_additional_cost
+from erpnext.manufacturing.doctype.bom.services.costing import get_exploded_good_qty
 from erpnext.manufacturing.doctype.production_plan.services.work_order_quantities import (
 	ProductionPlanWorkOrderQuantities,
 )
@@ -118,15 +119,11 @@ class BaseManufactureStockEntry(BaseStockEntry):
 					"BOM", self.doc.bom_no, "default_target_warehouse"
 				)
 
-			row.qty = row.qty * flt(self.doc.fg_completed_qty)
-			if row.get("process_loss_per"):
-				row.qty -= flt(
-					row.qty * row.get("process_loss_per") / 100, self.doc.precision("fg_completed_qty")
-				)
-
-			item_args["qty"] = ceil_qty_if_uom_has_whole_number(row.qty, row.stock_uom)
-			item_args["transfer_qty"] = item_args["qty"]
-			self.doc.append("items", item_args)
+			item_args["qty"] = get_secondary_item_qty(row, self.doc.fg_completed_qty)
+			# the BOM's rounded loss or the row's precision can take the whole qty
+			if item_args["qty"]:
+				item_args["transfer_qty"] = item_args["qty"]
+				self.doc.append("items", item_args)
 
 	def get_secondary_item_warehouse(self, secondary_item_type):
 		if secondary_item_type == "Scrap" and self.wo_doc and self.wo_doc.get("scrap_warehouse"):
@@ -280,6 +277,8 @@ class BaseManufactureStockEntry(BaseStockEntry):
 
 
 class ManufactureStockEntry(BaseManufactureStockEntry):
+	scope_return_to_job_card = True
+
 	def before_validate(self):
 		self.set_default_warehouse()
 		self.set_job_card_data()
@@ -892,6 +891,10 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 		for row in self._transfer_entries:
 			qty[row.original_item or row.item_code] += flt(row.transfer_qty)
 
+		for row in getattr(self, "_consumption_entries", None) or []:
+			if row.purpose == "Material Transfer for Manufacture" and row.job_card:
+				qty[row.original_item or row.item_code] -= flt(row.transfer_qty)
+
 		return qty
 
 	def _append_transfer_based_rm(self, row, pending_qty_to_mfg):
@@ -1027,7 +1030,7 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 		stock_entry = frappe.qb.DocType("Stock Entry")
 		stock_entry_detail = frappe.qb.DocType("Stock Entry Detail")
 
-		return (
+		query = (
 			frappe.qb.from_(stock_entry)
 			.inner_join(stock_entry_detail)
 			.on(stock_entry.name == stock_entry_detail.parent)
@@ -1041,7 +1044,14 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 			.orderby(stock_entry.creation)
 			.orderby(stock_entry.name)
 			.orderby(stock_entry_detail.idx)
-		).run(as_dict=1)
+		)
+		return self.filter_job_card_return(query, stock_entry).run(as_dict=1)
+
+	def filter_job_card_return(self, query, stock_entry):
+		if self.scope_return_to_job_card and self.doc.get("is_return") and self.doc.job_card:
+			return query.where(stock_entry.job_card == self.doc.job_card)
+
+		return query
 
 	def add_materials_from_transfer(self):
 		for row in self._transfer_entries:
@@ -1071,11 +1081,16 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 		stock_entry = frappe.qb.DocType("Stock Entry")
 		stock_entry_detail = frappe.qb.DocType("Stock Entry Detail")
 
-		return (
+		query = (
 			frappe.qb.from_(stock_entry)
 			.inner_join(stock_entry_detail)
 			.on(stock_entry.name == stock_entry_detail.parent)
-			.select(stock_entry_detail.star, stock_entry.fg_completed_qty, stock_entry.purpose)
+			.select(
+				stock_entry_detail.star,
+				stock_entry.fg_completed_qty,
+				stock_entry.purpose,
+				stock_entry.job_card,
+			)
 			.where(
 				(stock_entry.work_order == self.doc.work_order)
 				& (IfNull(stock_entry_detail.s_warehouse, "") != "")
@@ -1089,7 +1104,8 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 				& (stock_entry.docstatus == 1)
 			)
 			.orderby(stock_entry_detail.idx)
-		).run(as_dict=1)
+		)
+		return self.filter_job_card_return(query, stock_entry).run(as_dict=1)
 
 	def remove_consumed_materials_from_available(self):
 		for row in self._consumption_entries:
@@ -1560,7 +1576,8 @@ def _add_bom_table_specific_fields(query, doctype, table_name):
 		return query.select(
 			doctype.name,
 			doctype.cost_allocation_per,
-			doctype.process_loss_per,
+			doctype.stock_qty,
+			doctype.process_loss_qty,
 			doctype.secondary_item_type,
 			doctype.valuation_type,
 			(doctype.base_cost / NullIf(doctype.stock_qty, 0)).as_("manual_rate"),
@@ -1593,23 +1610,43 @@ def get_secondary_items(bom_no, work_order=None):
 		and work_order
 		and frappe.get_cached_value("Work Order", work_order, "use_multi_level_bom")
 	):
-		return get_secondary_items_from_sub_assemblies(bom_no)
+		return merge_secondary_items_by_bom_row(get_secondary_items_from_sub_assemblies(bom_no))
 	else:
 		return get_bom_items(bom_no, fetch_secondary_items=True)
 
 
 def get_secondary_items_from_sub_assemblies(bom_no, qty=1):
 	"""Secondary items of the sub-assembly BOMs at every level, for qty of the BOM's item."""
-	items = []
-	bom_items = get_bom_items(bom_no, qty=qty)
-	for row in bom_items:
-		if not row.bom_no:
-			continue
+	# by BOM, not item: two BOMs of one sub-assembly have their own yield and secondary items
+	qty_per_bom = defaultdict(float)
+	for row in _run_bom_items_query(bom_no, "BOM Item", qty):
+		if row.bom_no:
+			qty_per_bom[row.bom_no] += row.qty
 
-		items.extend(get_bom_items(row.bom_no, qty=row.qty, fetch_secondary_items=True))
-		items.extend(get_secondary_items_from_sub_assemblies(row.bom_no, row.qty))
+	items = []
+	for sub_bom_no, sub_assembly_qty in qty_per_bom.items():
+		# the sub-assembly's process loss makes more of it than the parent consumes, as in the explosion
+		bom = frappe.get_cached_value(
+			"BOM", sub_bom_no, ["quantity", "process_loss_qty", "is_phantom_bom"], as_dict=True
+		)
+		qty_made = sub_assembly_qty * (flt(bom.quantity) / get_exploded_good_qty(bom))
+		items.extend(get_bom_items(sub_bom_no, qty=qty_made, fetch_secondary_items=True))
+		items.extend(get_secondary_items_from_sub_assemblies(sub_bom_no, qty_made))
 
 	return items
+
+
+def merge_secondary_items_by_bom_row(items):
+	"""One row per BOM secondary row: a BOM reached through two paths makes its rows for both,
+	and rounding each path's qty on its own could lose or add a whole unit."""
+	merged = {}
+	for row in items:
+		if row.name in merged:
+			merged[row.name].qty += row.qty
+		else:
+			merged[row.name] = row
+
+	return list(merged.values())
 
 
 def get_secondary_item_key(row):
@@ -1831,6 +1868,18 @@ def set_previous_operation_serial_batch(parent_doc, row):
 	if bundle and bundle.get("name"):
 		row.serial_and_batch_bundle = bundle.name
 		row.use_serial_batch_fields = 0
+
+
+def get_secondary_item_qty(row, fg_qty):
+	"""Qty of a BOM secondary row for fg_qty, net of the BOM's rounded loss qty as BOM costing counts it.
+	Rounding the loss of a fractional qty here instead can add a whole unit."""
+	qty = flt(row.qty) * flt(fg_qty)
+	if flt(row.stock_qty):
+		qty = qty * (row.stock_qty - flt(row.process_loss_qty)) / row.stock_qty
+
+	qty = ceil_qty_if_uom_has_whole_number(qty, row.stock_uom)
+	# at the row's precision, so a qty that saves as 0 is left out
+	return flt(qty, frappe.get_precision("Stock Entry Detail", "qty"))
 
 
 def ceil_qty_if_uom_has_whole_number(qty, stock_uom):
