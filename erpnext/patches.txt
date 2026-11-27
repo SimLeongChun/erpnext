@@ -476,7 +476,7 @@ erpnext.patches.v16_0.enable_serial_batch_setting
 erpnext.patches.v16_0.fix_titles
 erpnext.patches.v16_0.co_by_product_patch
 erpnext.patches.v16_0.set_idx_of_migrated_secondary_items
-erpnext.patches.v16_0.update_requested_qty_packed_item
+erpnext.patches.v16_0.update_requested_qty_packed_item #2026-11-26
 erpnext.patches.v16_0.remove_payables_receivables_workspace
 erpnext.patches.v16_0.depends_on_inv_dimensions
 erpnext.patches.v16_0.uom_category
@@ -591,3 +591,5 @@ erpnext.patches.v16_0.set_reserved_components_return_cutoff
 erpnext.patches.v16_0.create_default_workstation_types
 erpnext.patches.v16_0.enable_operations_and_job_cards
 erpnext.patches.v16_0.set_accounting_dimension_filter_options
+erpnext.patches.v16_0.set_posting_date_in_payment_entry_reference
+erpnext.patches.v16_0.drop_warehouse_serial_no_index_from_serial_and_batch_entry

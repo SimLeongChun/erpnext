@@ -5230,6 +5230,178 @@ class TestWorkOrder(ERPNextTestSuite):
 		self.assertCountEqual(used_serials[rm_item], rm_serials)
 		self.assertCountEqual(used_serials[fg_item], fg_serials)
 
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"backflush_raw_materials_based_on": "BOM", "material_consumption": 0}
+	)
+	def test_partial_manufactures_round_whole_number_raw_material_once(self):
+		work_order, rm_item = make_whole_number_partial_work_order(rm_qty=1)
+
+		consumed_qty, fg_rates = [], []
+		for _ in range(4):
+			manufacture = submit_manufacture_of_one(work_order)
+			consumed_qty.append(sum(row.qty for row in manufacture.items if row.item_code == rm_item))
+			fg_rates.append(next(row.valuation_rate for row in manufacture.items if row.is_finished_item))
+
+		self.assertEqual(consumed_qty, [1, 0, 0, 0])
+		self.assertEqual(fg_rates, [100, 0, 0, 0])
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"backflush_raw_materials_based_on": "BOM", "material_consumption": 0}
+	)
+	def test_partial_manufactures_take_whole_number_raw_material_not_consumed_yet(self):
+		work_order, rm_item = make_whole_number_partial_work_order(rm_qty=2)
+		consumed_qty = []
+		for _ in range(4):
+			manufacture = submit_manufacture_of_one(work_order)
+			consumed_qty.append(sum(row.qty for row in manufacture.items if row.item_code == rm_item))
+		self.assertEqual(consumed_qty, [1, 0, 1, 0])
+
+		work_order, rm_item = make_whole_number_partial_work_order(rm_qty=1)
+		submit_manufacture_of_one(work_order).cancel()
+		manufacture = submit_manufacture_of_one(work_order)
+		self.assertEqual(sum(row.qty for row in manufacture.items if row.item_code == rm_item), 1)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings",
+		{
+			"backflush_raw_materials_based_on": "BOM",
+			"material_consumption": 0,
+			"validate_components_quantities_per_bom": 1,
+		},
+	)
+	def test_bom_component_check_takes_whole_number_share_of_running_total(self):
+		# 1.5 per unit: rounding each entry up would expect 2 every time
+		work_order, rm_item = make_whole_number_partial_work_order(rm_qty=6)
+		test_stock_entry.make_stock_entry(item_code=rm_item, target="Stores - _TC", qty=2, basic_rate=100)
+		consumed_qty = []
+		for _ in range(4):
+			manufacture = submit_manufacture_of_one(work_order)
+			consumed_qty.append(sum(row.qty for row in manufacture.items if row.item_code == rm_item))
+		self.assertEqual(consumed_qty, [2, 1, 2, 1])
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings",
+		{
+			"backflush_raw_materials_based_on": "BOM",
+			"material_consumption": 1,
+			"validate_components_quantities_per_bom": 1,
+		},
+	)
+	def test_bom_component_check_takes_unconsumed_share_with_continuous_consumption(self):
+		# 0.5 per unit: the second entry takes 1 of the 1 unconsumed, not 0 of the running total
+		work_order, rm_item = make_whole_number_partial_work_order(rm_qty=2)
+		consumed_qty = []
+		for _ in range(2):
+			manufacture = submit_manufacture_of_one(work_order)
+			consumed_qty.append(sum(row.qty for row in manufacture.items if row.item_code == rm_item))
+		self.assertEqual(consumed_qty, [1, 1])
+
+	def test_bom_component_check_keeps_bom_qty_for_semi_finished_goods(self):
+		"""A semi-finished goods entry is checked on its own BOM, not on the Work Order's running total."""
+		from erpnext.stock.doctype.stock_entry.services.manufacturing import ManufactureStockEntry
+
+		# the Work Order's BOM needs 1 Nos per 4 finished goods, the Job Card BOM 1 Nos per unit
+		work_order, rm_item = make_whole_number_partial_work_order(rm_qty=1)
+		entry = frappe.new_doc("Stock Entry", purpose="Manufacture", fg_completed_qty=4)
+		service = ManufactureStockEntry(entry)
+		service._wo_doc = work_order
+		work_order_bom_item = frappe._dict(item_code=rm_item, qty=0.25, stock_uom="Nos")
+		self.assertEqual(service.get_bom_component_qty(work_order_bom_item), 1)
+
+		work_order.track_semi_finished_goods = 1
+		job_card_bom_item = frappe._dict(item_code=rm_item, qty=1, stock_uom="Nos")
+		self.assertEqual(service.get_bom_component_qty(job_card_bom_item), 4)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"backflush_raw_materials_based_on": "BOM", "material_consumption": 0}
+	)
+	def test_partial_manufactures_without_raw_materials_value_scrap_at_zero(self):
+		"""An entry whose whole-number share was consumed earlier values nothing, its scrap included."""
+		for valuation_type in ("Valuation Rate", "Manual"):
+			with self.subTest(valuation_type=valuation_type):
+				rates = get_partial_manufacture_scrap_rates(valuation_type)
+				self.assertEqual(rates, [(90, 10), (0, 0), (0, 0), (0, 0)])
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"backflush_raw_materials_based_on": "BOM", "material_consumption": 0}
+	)
+	def test_partial_manufactures_cap_scrap_at_consumed_cost(self):
+		"""Scrap worth more than the entry's consumed cost is scaled down to it, so the finished good is not negative."""
+		for valuation_type in ("Valuation Rate", "Manual"):
+			with self.subTest(valuation_type=valuation_type):
+				# later entries consume 1 Kg at 1 but no Nos, against scrap at 10
+				rates = get_partial_manufacture_scrap_rates(valuation_type, kg_rm_qty=4)
+				self.assertEqual(rates, [(91, 10), (0, 1), (0, 1), (0, 1)])
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"backflush_raw_materials_based_on": "BOM", "material_consumption": 0}
+	)
+	def test_repost_keeps_capped_scrap_rate(self):
+		"""A repost after later entries submit still caps the scrap of a short entry."""
+		scrap_item = make_item(properties={"is_stock_item": 1, "stock_uom": "Nos", "valuation_rate": 10}).name
+		work_order, _rm_item = make_whole_number_partial_work_order(
+			rm_qty=1, scrap_item=scrap_item, kg_rm_qty=4
+		)
+		manufactures = [submit_manufacture_of_one(work_order) for _ in range(4)]
+
+		manufacture = frappe.get_doc("Stock Entry", manufactures[1].name)
+		manufacture.flags.via_repost = True
+		manufacture.calculate_rate_and_amount(reset_outgoing_rate=False, raise_error_if_no_rate=False)
+		scrap_row = next(row for row in manufacture.items if row.item_code == scrap_item)
+		self.assertEqual(scrap_row.basic_rate, 1)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"backflush_raw_materials_based_on": "BOM", "material_consumption": 0}
+	)
+	def test_capped_manual_scrap_rate_goes_back_up_with_consumed_cost(self):
+		"""A Manual scrap rate capped on a short draft goes back to its BOM rate once the consumed cost covers it."""
+		scrap_item = make_item(properties={"is_stock_item": 1, "stock_uom": "Nos"}).name
+		work_order, _rm_item = make_whole_number_partial_work_order(
+			rm_qty=1, scrap_item=scrap_item, scrap_valuation_type="Manual", kg_rm_qty=4
+		)
+		submit_manufacture_of_one(work_order)
+
+		# consumes 1 Kg at 1 and no Nos, against scrap at 10
+		manufacture = frappe.get_doc(make_stock_entry(work_order.name, "Manufacture", 1))
+		manufacture.save()
+		scrap_row = next(row for row in manufacture.items if row.item_code == scrap_item)
+		self.assertEqual(scrap_row.basic_rate, 1)
+
+		# only Kg at 99 is left to consume
+		kg_item = next(row.item_code for row in manufacture.items if row.s_warehouse)
+		test_stock_entry.make_stock_entry(item_code=kg_item, target="Stores - _TC", qty=3, basic_rate=99)
+		test_stock_entry.make_stock_entry(item_code=kg_item, source="Stores - _TC", qty=3)
+		manufacture.save()
+		scrap_row = next(row for row in manufacture.items if row.item_code == scrap_item)
+		self.assertEqual(scrap_row.basic_rate, 10)
+
+	def test_capped_secondary_rows_add_up_to_consumed_cost(self):
+		"""Capping rounds the running total, so a small consumed cost leaves no row negative."""
+		entry = frappe.new_doc("Stock Entry")
+		for _ in range(5):
+			entry.append("items", {"transfer_qty": 1, "basic_rate": 1, "basic_amount": 1})
+
+		entry.cap_costed_out_items(entry.items, 0.03)
+		self.assertEqual([row.basic_amount for row in entry.items], [0.01, 0, 0.01, 0, 0.01])
+
+	def test_capping_sets_negative_secondary_rows_to_zero(self):
+		"""A sub-assembly row priced below zero by own-cost rows is not kept negative by the cap."""
+		entry = frappe.new_doc("Stock Entry")
+		for amount in (10, -4.5):
+			entry.append("items", {"transfer_qty": 1, "basic_rate": amount, "basic_amount": amount})
+
+		entry.cap_costed_out_items(entry.items, 1)
+		self.assertEqual([row.basic_amount for row in entry.items], [1, 0])
+
+	def test_capping_sets_negative_secondary_rows_to_zero_within_the_consumed_cost(self):
+		"""Rows that add up to less than the consumed cost still keep no negative row."""
+		entry = frappe.new_doc("Stock Entry")
+		for amount in (0.6, -0.05):
+			entry.append("items", {"transfer_qty": 1, "basic_rate": amount, "basic_amount": amount})
+
+		entry.cap_costed_out_items(entry.items, 1)
+		self.assertEqual([row.basic_amount for row in entry.items], [0.6, 0])
+
 	def test_partial_disassemblies_round_whole_number_components(self):
 		frappe.db.set_value("UOM", "Nos", "must_be_whole_number", 1)
 		wo, rm_item = make_whole_number_work_order("Test Whole Number Partial Disassembly")
@@ -6387,6 +6559,218 @@ class TestWorkOrder(ERPNextTestSuite):
 		wo.reload()
 		return wo
 
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"add_corrective_operation_cost_in_finished_good_valuation": 1}
+	)
+	def test_subcontracted_final_operation_books_work_order_costs(self):
+		sco = self.make_subcontracted_work_order_with_costs()
+
+		first = self.make_receipt_of_subcontracted_work_order(sco, 4)
+		second = self.make_receipt_of_subcontracted_work_order(sco, 6)
+
+		for scr, additional, corrective in ((first, 40, 20), (second, 60, 30)):
+			self.assertEqual(self.get_additional_cost(scr, "Additional Operating Cost"), additional)
+			self.assertEqual(self.get_additional_cost(scr, "Corrective Operation Cost"), corrective)
+			self.assertEqual({row.item_row for row in scr.additional_costs}, {scr.items[0].name})
+		self.assertEqual(flt(first.items[0].additional_cost_per_qty), 15)
+
+	def test_work_order_cost_shares_add_up_to_the_cost(self):
+		from erpnext.manufacturing.doctype.bom.services.operations_cost import _split_per_unit_cost
+
+		shares = _split_per_unit_cost(50 / 3, [1, 1, 1], 2)
+		self.assertEqual(shares, [16.67, 16.66, 16.67])
+		self.assertEqual(flt(sum(shares), 2), 50)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"add_corrective_operation_cost_in_finished_good_valuation": 1}
+	)
+	def test_returned_corrective_operation_cost_is_booked_again(self):
+		from erpnext.controllers.sales_and_purchase_return import make_return_doc
+
+		sco = self.make_subcontracted_work_order_with_costs()
+		scr = self.make_receipt_of_subcontracted_work_order(sco, 4)
+
+		scr_return = make_return_doc("Subcontracting Receipt", scr.name)
+		scr_return.items[0].qty = -2
+		scr_return.submit()
+		self.assertEqual(self.get_additional_cost(scr_return, "Corrective Operation Cost"), -10)
+
+		rest = self.make_receipt_of_subcontracted_work_order(sco, 8)
+		self.assertEqual(self.get_additional_cost(rest, "Corrective Operation Cost"), 40)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"add_corrective_operation_cost_in_finished_good_valuation": 0}
+	)
+	def test_work_order_costs_are_replaced_on_save(self):
+		from erpnext.subcontracting.doctype.subcontracting_order.subcontracting_order import (
+			make_subcontracting_receipt,
+		)
+
+		sco = self.make_subcontracted_work_order_with_costs()
+		scr = make_subcontracting_receipt(sco.name)
+		scr.items[0].qty = 4
+		scr.append(
+			"additional_costs",
+			{
+				"expense_account": "Expenses Included In Valuation - _TC",
+				"description": "Freight",
+				"amount": 10,
+			},
+		)
+		scr.save()
+		scr.save()
+
+		self.assertEqual(
+			[(row.description, row.amount) for row in scr.additional_costs],
+			[("Freight", 10), ("Additional Operating Cost", 40)],
+		)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"add_corrective_operation_cost_in_finished_good_valuation": 0}
+	)
+	def test_work_order_cost_keeps_the_account_picked(self):
+		from erpnext.subcontracting.doctype.subcontracting_order.subcontracting_order import (
+			make_subcontracting_receipt,
+		)
+
+		sco = self.make_subcontracted_work_order_with_costs()
+		scr = make_subcontracting_receipt(sco.name)
+		scr.items[0].qty = 4
+		scr.save()
+
+		scr.additional_costs[0].expense_account = "Expenses Included In Valuation - _TC"
+		scr.save()
+		self.assertEqual(scr.additional_costs[0].expense_account, "Expenses Included In Valuation - _TC")
+
+	def test_work_order_cost_rows_keep_their_accounts_on_first_save(self):
+		from erpnext.subcontracting.doctype.subcontracting_order.subcontracting_order import (
+			make_subcontracting_receipt,
+		)
+
+		sco = self.make_subcontracted_work_order_with_costs()
+		scr = make_subcontracting_receipt(sco.name)
+		scr.items[0].qty = 2
+		scr.append("items", scr.items[0].as_dict(no_default_fields=True))
+		# rows of an unsaved form carry temporary names
+		for item in scr.items:
+			item.name = f"new-subcontracting-receipt-item-{item.idx}"
+		scr.set_missing_values()
+
+		picked_account = "Expenses Included In Valuation - _TC"
+		cost_rows = [row for row in scr.additional_costs if row.work_order and not row.has_corrective_cost]
+		default_account = cost_rows[0].expense_account
+		cost_rows[1].expense_account = picked_account
+		scr.insert()
+
+		accounts = [
+			row.expense_account
+			for row in scr.additional_costs
+			if row.work_order and not row.has_corrective_cost
+		]
+		self.assertEqual(accounts, [default_account, picked_account])
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"add_corrective_operation_cost_in_finished_good_valuation": 0}
+	)
+	def test_work_order_costs_leave_the_order_costs_to_later_receipts(self):
+		from erpnext.controllers.sales_and_purchase_return import make_return_doc
+
+		freight = {
+			"expense_account": "Expenses Included In Valuation - _TC",
+			"description": "Freight",
+			"amount": 100,
+		}
+		sco = self.make_subcontracted_work_order_with_costs(additional_costs=[freight])
+
+		first = self.make_receipt_of_subcontracted_work_order(sco, 4)
+		scr_return = make_return_doc("Subcontracting Receipt", first.name)
+		scr_return.items[0].qty = -2
+		scr_return.submit()
+		rest = self.make_receipt_of_subcontracted_work_order(sco, 8)
+
+		self.assertEqual(self.get_additional_cost(rest, "Freight"), 80)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"add_corrective_operation_cost_in_finished_good_valuation": 0}
+	)
+	def test_work_order_costs_of_unlinked_receipt_leave_the_order_costs_to_later_receipts(self):
+		from erpnext.subcontracting.doctype.subcontracting_order.subcontracting_order import (
+			get_mapped_subcontracting_receipt,
+		)
+
+		freight = {
+			"expense_account": "Expenses Included In Valuation - _TC",
+			"description": "Freight",
+			"amount": 100,
+		}
+		sco = self.make_subcontracted_work_order_with_costs(additional_costs=[freight])
+
+		first = get_mapped_subcontracting_receipt(sco.name, items=[{"name": sco.items[0].name, "qty": 4}])
+		first.set("additional_costs", [])
+		first.submit()
+		self.assertEqual(self.get_additional_cost(first, "Additional Operating Cost"), 40)
+		rest = self.make_receipt_of_subcontracted_work_order(sco, 6)
+
+		self.assertEqual(self.get_additional_cost(rest, "Freight"), 100)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"add_corrective_operation_cost_in_finished_good_valuation": 1}
+	)
+	def test_work_order_costs_are_booked_on_process_loss_qty_too(self):
+		sco = self.make_subcontracted_work_order_with_costs()
+
+		receipts = [
+			self.make_receipt_of_subcontracted_work_order(sco, 5, process_loss_qty=1) for _ in range(2)
+		]
+
+		for description, cost in (("Additional Operating Cost", 100), ("Corrective Operation Cost", 50)):
+			self.assertEqual(sum(self.get_additional_cost(scr, description) for scr in receipts), cost)
+
+	@ERPNextTestSuite.change_settings(
+		"Manufacturing Settings", {"add_corrective_operation_cost_in_finished_good_valuation": 1}
+	)
+	def test_rejected_return_leaves_the_corrective_cost_to_later_receipts(self):
+		from erpnext.controllers.sales_and_purchase_return import make_return_doc
+		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
+		from erpnext.subcontracting.doctype.subcontracting_order.subcontracting_order import (
+			get_mapped_subcontracting_receipt,
+		)
+
+		sco = self.make_subcontracted_work_order_with_costs()
+		first = get_mapped_subcontracting_receipt(sco.name, items=[{"name": sco.items[0].name, "qty": 5}])
+		first.items[0].qty = 4
+		first.items[0].rejected_qty = 1
+		first.items[0].rejected_warehouse = create_warehouse("Test SOI Rejected WH", company="_Test Company")
+		first.submit()
+		make_return_doc("Subcontracting Receipt", first.name, return_against_rejected_qty=True).submit()
+		rest = self.make_receipt_of_subcontracted_work_order(sco, 6)
+
+		self.assertEqual(self.get_additional_cost(rest, "Corrective Operation Cost"), 30)
+
+	def make_subcontracted_work_order_with_costs(self, additional_costs=()):
+		"""Subcontracting Order for all of a Work Order with 100 additional and 50 corrective operation cost."""
+		from erpnext.controllers.subcontracting_controller import make_rm_stock_entry
+
+		wo = self.make_subcontracted_operation_work_order(skip_transfer=1)
+		wo.db_set({"additional_operating_cost": 100, "corrective_operation_cost": 50})
+		test_stock_entry.make_stock_entry(
+			item_code=wo.required_items[0].item_code, target="Stores - _TC", qty=10, basic_rate=100
+		)
+		sco = self.subcontract_work_order(wo, 10, additional_costs=additional_costs)
+		frappe.get_doc(make_rm_stock_entry(sco.name)).submit()
+		return sco
+
+	def make_receipt_of_subcontracted_work_order(self, sco, qty, process_loss_qty=0):
+		from erpnext.subcontracting.doctype.subcontracting_order.subcontracting_order import (
+			get_mapped_subcontracting_receipt,
+		)
+
+		scr = get_mapped_subcontracting_receipt(sco.name, items=[{"name": sco.items[0].name, "qty": qty}])
+		scr.items[0].qty = qty - process_loss_qty
+		scr.items[0].process_loss_qty = process_loss_qty
+		scr.submit()
+		return scr
+
 	def make_subcontracted_operation_work_order(self, **kwargs):
 		"""A Work Order for 10 shirts whose only operation, a subcontracted dyeing, uses 10 cloth."""
 		company = "_Test Company"
@@ -6456,7 +6840,7 @@ class TestWorkOrder(ERPNextTestSuite):
 			**kwargs,
 		)
 
-	def subcontract_work_order(self, wo, qty, reserve_warehouse=None):
+	def subcontract_work_order(self, wo, qty, reserve_warehouse=None, additional_costs=()):
 		"""Submit a Subcontracting Order for qty of the Work Order's subcontracted Job Card."""
 		from erpnext.buying.doctype.purchase_order.mapper import make_subcontracting_order
 		from erpnext.manufacturing.doctype.job_card.mapper import make_subcontracting_po
@@ -6476,6 +6860,8 @@ class TestWorkOrder(ERPNextTestSuite):
 		sco = make_subcontracting_order(po.name)
 		sco.supplier_warehouse = supplier_warehouse
 		sco.set_reserve_warehouse = reserve_warehouse
+		for row in additional_costs:
+			sco.append("additional_costs", row)
 		sco.insert()
 		sco.submit()
 		return sco
@@ -10703,6 +11089,69 @@ def make_multi_level_manufacture_entry(fg_item, bom_no):
 	se_doc.insert()
 	se_doc.submit()
 	return se_doc
+
+
+def make_whole_number_partial_work_order(
+	rm_qty, scrap_item=None, scrap_valuation_type="Valuation Rate", kg_rm_qty=0
+):
+	"""Work Order for 4 Nos of a finished good that needs rm_qty Nos of a whole-number raw material
+	at 100 and kg_rm_qty Kg of another at 1, and makes 1 Nos of scrap_item per finished good, valued at 10 each."""
+	frappe.db.set_value("UOM", "Nos", "must_be_whole_number", 1)
+	rm_item = make_item(properties={"is_stock_item": 1, "stock_uom": "Nos", "valuation_rate": 100}).name
+	fg_item = make_item(properties={"is_stock_item": 1, "stock_uom": "Nos"}).name
+	bom = make_bom(
+		item=fg_item, quantity=4, raw_materials=[rm_item], rm_qty=rm_qty, currency="INR", do_not_save=True
+	)
+	if kg_rm_qty:
+		kg_item = make_item(properties={"is_stock_item": 1, "stock_uom": "Kg", "valuation_rate": 1}).name
+		bom.append(
+			"items", {"item_code": kg_item, "qty": kg_rm_qty, "uom": "Kg", "stock_uom": "Kg", "rate": 1}
+		)
+		test_stock_entry.make_stock_entry(
+			item_code=kg_item, target="Stores - _TC", qty=kg_rm_qty, basic_rate=1
+		)
+	if scrap_item:
+		bom.append(
+			"secondary_items",
+			{
+				"secondary_item_type": "Scrap",
+				"item_code": scrap_item,
+				"qty": 4,
+				"uom": "Nos",
+				"valuation_type": scrap_valuation_type,
+				"cost": 40 if scrap_valuation_type == "Manual" else 0,
+			},
+		)
+	bom.insert()
+	bom.submit()
+	test_stock_entry.make_stock_entry(item_code=rm_item, target="Stores - _TC", qty=4, basic_rate=100)
+	work_order = make_wo_order_test_record(
+		production_item=fg_item, bom_no=bom.name, qty=4, skip_transfer=1, source_warehouse="Stores - _TC"
+	)
+	return work_order, rm_item
+
+
+def submit_manufacture_of_one(work_order):
+	manufacture = frappe.get_doc(make_stock_entry(work_order.name, "Manufacture", 1))
+	manufacture.submit()
+	return manufacture
+
+
+def get_partial_manufacture_scrap_rates(scrap_valuation_type, kg_rm_qty=0):
+	"""(finished good, scrap) valuation rates of four Manufactures of 1 against a Work Order that needs 1 Nos."""
+	scrap_item = make_item(properties={"is_stock_item": 1, "stock_uom": "Nos", "valuation_rate": 10}).name
+	work_order, _rm_item = make_whole_number_partial_work_order(
+		rm_qty=1, scrap_item=scrap_item, scrap_valuation_type=scrap_valuation_type, kg_rm_qty=kg_rm_qty
+	)
+
+	rates = []
+	for _ in range(4):
+		manufacture = submit_manufacture_of_one(work_order)
+		fg_row = next(row for row in manufacture.items if row.is_finished_item)
+		scrap_row = next(row for row in manufacture.items if row.item_code == scrap_item)
+		rates.append((fg_row.valuation_rate, scrap_row.valuation_rate))
+
+	return rates
 
 
 def make_whole_number_work_order(name, rm_properties=None, rm_row_uom=None):

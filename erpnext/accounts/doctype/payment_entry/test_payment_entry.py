@@ -7,7 +7,7 @@ from itertools import product
 import frappe
 from frappe import qb
 from frappe.desk.notifications import get_open_count
-from frappe.utils import add_days, flt, nowdate
+from frappe.utils import add_days, flt, getdate, nowdate
 from freezegun import freeze_time
 
 from erpnext.accounts.doctype.account.test_account import create_account
@@ -1010,6 +1010,77 @@ class TestPaymentEntry(ERPNextTestSuite):
 		self.assertEqual(si.payment_schedule[0].paid_amount, 186)
 		self.assertEqual(si.payment_schedule[0].outstanding, 0)
 		self.assertEqual(si.payment_schedule[0].discounted_amount, 50)
+
+	def _create_two_tax_invoice_with_discount(self, discount, round_off_account="Round Off - _TC"):
+		"""Create a taxed Sales Invoice with an amount discount that leaves a rounding remainder."""
+		si = create_sales_invoice(do_not_save=1, qty=1, rate=100)
+		template_name = f"Test Discount Amount {discount} Rounding Template"
+		create_payment_terms_template_with_discount(
+			name=f"30 Credit Days with Rs.{discount} Discount",
+			discount_type="Amount",
+			discount=discount,
+			template_name=template_name,
+		)
+		si.payment_terms_template = template_name
+		frappe.db.set_value("Company", si.company, "default_discount_account", "Write Off - _TC")
+		frappe.db.set_value("Company", si.company, "round_off_account", round_off_account)
+
+		for account_head, description in (
+			("_Test Account VAT - _TC", "VAT"),
+			("_Test Account Customs Duty - _TC", "Customs Duty"),
+		):
+			si.append(
+				"taxes",
+				{
+					"charge_type": "On Net Total",
+					"account_head": account_head,
+					"cost_center": "_Test Cost Center - _TC",
+					"description": description,
+					"rate": 5,
+				},
+			)
+		si.save()
+		si.submit()
+		return si
+
+	@ERPNextTestSuite.change_settings("Accounts Settings", {"book_tax_discount_loss": 1})
+	def test_payment_entry_against_discount_amount_with_tax_loss_rounding(self):
+		si = self._create_two_tax_invoice_with_discount(10)
+
+		pe = get_payment_entry("Sales Invoice", si.name, bank_account="_Test Cash - _TC")
+		self.assertEqual(pe.difference_amount, 0.0)
+		self.assertEqual(pe.deductions[-1].account, "Round Off - _TC")
+		self.assertEqual(pe.deductions[-1].amount, 0.01)
+
+		pe.submit()
+		self.assertEqual(pe.docstatus, 1)
+
+	@ERPNextTestSuite.change_settings("Accounts Settings", {"book_tax_discount_loss": 1})
+	def test_payment_entry_against_discount_amount_with_tax_loss_negative_rounding(self):
+		si = self._create_two_tax_invoice_with_discount(1)
+
+		pe = get_payment_entry("Sales Invoice", si.name, bank_account="_Test Cash - _TC")
+		self.assertEqual(pe.difference_amount, 0.0)
+		self.assertEqual(pe.deductions[-1].account, "Round Off - _TC")
+		self.assertEqual(pe.deductions[-1].amount, -0.01)
+
+		pe.submit()
+		self.assertEqual(pe.docstatus, 1)
+
+	@ERPNextTestSuite.change_settings("Accounts Settings", {"book_tax_discount_loss": 1})
+	def test_payment_entry_against_discount_amount_with_tax_loss_missing_round_off_account(self):
+		si = self._create_two_tax_invoice_with_discount(10, round_off_account="")
+		try:
+			self.assertRaisesRegex(
+				frappe.ValidationError,
+				"Round Off Account",
+				get_payment_entry,
+				"Sales Invoice",
+				si.name,
+				bank_account="_Test Cash - _TC",
+			)
+		finally:
+			frappe.db.set_value("Company", si.company, "round_off_account", "Round Off - _TC")
 
 	def test_early_payment_discount_on_usd_purchase_invoice_from_usd_bank(self):
 		pi = make_purchase_invoice(
@@ -2603,6 +2674,7 @@ class TestPaymentEntry(ERPNextTestSuite):
 			"total_amount": 5000.0,
 			"outstanding_amount": 5000.0,
 			"exchange_rate": 1.0,
+			"posting_date": getdate(so.transaction_date),
 			"due_date": None,
 			"bill_no": None,
 		}

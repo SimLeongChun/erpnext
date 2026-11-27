@@ -18,7 +18,19 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 		this.frm.make_methods = {
 			Dunning: this.make_dunning.bind(this),
 			"Invoice Discounting": this.make_invoice_discounting.bind(this),
+			"Payment Entry": () => this.make_payment_entry(),
 		};
+		this.frm.can_make_methods = { "Payment Entry": () => this.can_record_payment() };
+	}
+	can_record_payment() {
+		const doc = this.frm.doc;
+		return doc.docstatus == 1 && doc.outstanding_amount != 0 && frappe.model.can_create("Payment Entry");
+	}
+	add_record_payment_button() {
+		if (!this.can_record_payment()) return;
+		const label = this.frm.doc.outstanding_amount < 0 ? __("Record Refund") : __("Record Payment");
+		this.frm.add_custom_button(label, () => this.make_payment_entry());
+		this.frm.change_custom_button_type(label, null, "primary");
 	}
 	company() {
 		super.company();
@@ -94,10 +106,7 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 			erpnext.accounts.ledger_preview.show_stock_ledger_preview(this.frm);
 		}
 
-		if (doc.docstatus == 1 && doc.outstanding_amount != 0 && frappe.model.can_create("Payment Entry")) {
-			this.frm.add_custom_button(__("Payment"), () => this.make_payment_entry(), __("Create"));
-			this.frm.page.set_inner_btn_group_as_primary(__("Create"));
-		}
+		const can_record_payment = this.can_record_payment();
 
 		if (doc.docstatus == 1 && !doc.is_return) {
 			var is_delivered_by_supplier = false;
@@ -115,7 +124,9 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 					this.make_sales_return.bind(this),
 					__("Create")
 				);
-				this.frm.page.set_inner_btn_group_as_primary(__("Create"));
+				if (!can_record_payment) {
+					this.frm.page.set_inner_btn_group_as_primary(__("Create"));
+				}
 			}
 
 			if (cint(doc.update_stock) != 1 && frappe.model.can_create("Delivery Note")) {
@@ -172,52 +183,24 @@ erpnext.accounts.SalesInvoiceController = class SalesInvoiceController extends (
 				);
 			}
 		}
+
 		this.toggle_get_items();
 
 		this.set_default_print_format();
-		if (doc.docstatus == 1 && frappe.model.can_create("Purchase Invoice")) {
-			let internal = me.frm.doc.is_internal_customer;
-			if (internal) {
-				let button_label =
-					me.frm.doc.company === me.frm.doc.represents_company
-						? "Internal Purchase Invoice"
-						: "Inter Company Purchase Invoice";
+		if (doc.docstatus == 1 && doc.is_internal_customer) {
+			let button_label =
+				doc.company === doc.represents_company
+					? __("Internal Purchase Invoice")
+					: __("Inter Company Purchase Invoice");
 
-				frappe.call({
-					method: "erpnext.accounts.doctype.sales_invoice.mapper.get_received_items",
-					args: {
-						reference_name: me.frm.doc.name,
-						doctype: "Purchase Invoice",
-						reference_fieldname: "sales_invoice_item",
-					},
-					callback: function (r) {
-						if (r.exc) return;
-						const received_items = r.message || {};
-						// A Sales Invoice made from a Purchase Invoice links it without item references.
-						const is_made_from_purchase_invoice =
-							doc.inter_company_invoice_reference && $.isEmptyObject(received_items);
-						const has_pending_qty = me.frm.doc.items.some(
-							(item) =>
-								flt(
-									item.stock_qty - flt(received_items[item.name]),
-									precision("stock_qty", item)
-								) > 0
-						);
-						if (is_made_from_purchase_invoice || !has_pending_qty) return;
-
-						me.frm.add_custom_button(
-							__(button_label),
-							function () {
-								me.make_inter_company_invoice();
-							},
-							__("Create")
-						);
-					},
-				});
-			}
+			this.add_inter_company_button(button_label, "Purchase Invoice", "sales_invoice_item", () =>
+				this.make_inter_company_invoice()
+			);
 		}
 
-		erpnext.accounts.unreconcile_payment.add_unreconcile_btn(me.frm);
+		Promise.resolve(erpnext.accounts.unreconcile_payment.add_unreconcile_btn(me.frm)).then(() =>
+			this.add_record_payment_button()
+		);
 
 		if (this.frm.doc.is_created_using_pos && !this.frm.doc.is_return) {
 			erpnext.accounts.dimensions.update_dimension(this.frm, this.frm.doctype);
@@ -884,7 +867,6 @@ frappe.ui.form.on("Sales Invoice", {
 			"Delivery Note": "Delivery",
 			"Sales Invoice": "Return / Credit Note",
 			"Payment Request": "Payment Request",
-			"Payment Entry": "Payment",
 		};
 
 		frm.set_query("time_sheet", "timesheets", function (doc, cdt, cdn) {

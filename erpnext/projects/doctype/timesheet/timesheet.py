@@ -8,7 +8,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.query_builder.functions import Coalesce, Concat, Date, Round
-from frappe.utils import cint, cstr, flt, get_datetime, getdate, nowdate
+from frappe.utils import cint, cstr, flt, formatdate, get_datetime, getdate
 from frappe.utils.deprecations import deprecated
 
 import erpnext
@@ -83,12 +83,24 @@ class Timesheet(Document):
 
 	def set_exchange_rate(self):
 		"""A company currency Timesheet always has rate 1. A foreign one without a rate gets
-		the current rate. A rate that is set, 1 included, is kept."""
+		the rate on its start date. A set rate is kept, but 1 only while a rate exists:
+		drafts used to get 1 when none was found."""
 		company_currency = self.get_company_currency()
 		if not self.currency or self.currency == company_currency:
 			self.exchange_rate = 1
-		elif not flt(self.exchange_rate):
-			self.exchange_rate = get_exchange_rate(self.currency, company_currency) or 1
+		elif flt(self.exchange_rate) in (0, 1):
+			rate = get_exchange_rate(self.currency, company_currency, self.start_date)
+			if not rate or not flt(self.exchange_rate):
+				self.exchange_rate = rate
+
+	def validate_exchange_rate(self):
+		if not flt(self.exchange_rate):
+			frappe.throw(
+				_(
+					"No exchange rate was found for {0} to {1} on {2}. Please set the Exchange Rate, or create a Currency Exchange record for a rate of 1."
+				).format(self.currency, self.get_company_currency(), formatdate(self.start_date)),
+				title=_("Exchange Rate Missing"),
+			)
 
 	def get_company_currency(self):
 		if self.company:
@@ -195,6 +207,9 @@ class Timesheet(Document):
 	def on_cancel(self):
 		self.update_task_and_project()
 
+	def before_submit(self):
+		self.validate_exchange_rate()
+
 	def on_submit(self):
 		self.validate_mandatory_fields()
 		self.update_task_and_project()
@@ -217,7 +232,11 @@ class Timesheet(Document):
 			if data.task and data.task not in tasks:
 				task = frappe.get_doc("Task", data.task)
 				task.update_time_and_costing()
-				task.status = get_task_status(task)
+				status = get_task_status(task)
+				if status == "Completed" and task.status != "Completed" and not task.completed_on:
+					# the work ended on the last completed time log, not when this timesheet is submitted
+					task.completed_on = min(getdate(get_last_completed_log_time(task.name)), getdate())
+				task.status = status
 				task.save(ignore_permissions=True)
 				tasks.append(data.task)
 
@@ -363,7 +382,7 @@ class Timesheet(Document):
 
 	def update_cost(self):
 		for time_log in self.time_logs:
-			time_log.update_cost(self.employee, self.currency, self.exchange_rate)
+			time_log.update_cost(self.employee, self.currency, self.exchange_rate, self.start_date)
 
 	def update_time_rates(self, ts_detail):
 		if not ts_detail.is_billable:
@@ -417,6 +436,14 @@ def get_task_status(task: Document) -> str:
 	if not completed:
 		return "Open"
 	return "Completed" if any(completed) else "Working"
+
+
+def get_last_completed_log_time(task: str):
+	return frappe.db.get_value(
+		"Timesheet Detail",
+		{"task": task, "docstatus": 1, "parenttype": "Timesheet", "completed": 1},
+		[{"MAX": "to_time"}],
+	)
 
 
 @frappe.whitelist()
@@ -626,7 +653,10 @@ def make_sales_invoice(
 
 @frappe.whitelist()
 def get_activity_cost(
-	employee: str | None = None, activity_type: str | None = None, currency: str | None = None
+	employee: str | None = None,
+	activity_type: str | None = None,
+	currency: str | None = None,
+	transaction_date: str | None = None,
 ):
 	if not frappe.has_permission("Timesheet", "read"):
 		_refuse()
@@ -637,11 +667,14 @@ def get_activity_cost(
 		employee = cstr(employee)
 		if not frappe.has_permission("Employee", "select", doc=employee):
 			_refuse()
-	return _get_activity_cost(employee, activity_type, currency)
+	return _get_activity_cost(employee, activity_type, currency, transaction_date)
 
 
 def _get_activity_cost(
-	employee: str | None = None, activity_type: str | None = None, currency: str | None = None
+	employee: str | None = None,
+	activity_type: str | None = None,
+	currency: str | None = None,
+	transaction_date: str | None = None,
 ):
 	base_currency = frappe.defaults.get_global_default("currency")
 	rate = frappe.db.get_values(
@@ -665,12 +698,12 @@ def _get_activity_cost(
 			as_dict=True,
 		)
 	if rate and currency and currency != base_currency:
-		exchange_rate = get_exchange_rate(base_currency, currency)
+		exchange_rate = get_exchange_rate(base_currency, currency, transaction_date)
 		if not exchange_rate:
 			frappe.throw(
 				_(
 					"Unable to find exchange rate for {0} to {1} for key date {2}. Please create a Currency Exchange record manually."
-				).format(base_currency, currency, nowdate())
+				).format(base_currency, currency, getdate(transaction_date))
 			)
 
 		rate[0]["costing_rate"] = rate[0]["costing_rate"] * exchange_rate
